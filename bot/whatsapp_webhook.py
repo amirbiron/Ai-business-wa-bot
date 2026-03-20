@@ -6,12 +6,14 @@ Meta שולח הודעות נכנסות ל-POST /webhook/whatsapp.
 עיבוד ההודעות מתבצע ב-thread נפרד כדי להחזיר 200 מיד ל-Meta.
 """
 
+import hashlib
+import hmac
 import logging
 import threading
 
 from flask import Blueprint, request, jsonify
 
-from ai_chatbot.config import WHATSAPP_VERIFY_TOKEN
+from ai_chatbot.config import WHATSAPP_VERIFY_TOKEN, WHATSAPP_APP_SECRET
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,13 @@ def receive_message():
     Meta דורש תשובה תוך ~20 שניות — בלי thread, ה-RAG+LLM pipeline
     יכול לחרוג מהזמן ולגרום ל-retry ועיבוד כפול.
     """
+    # אימות חתימת HMAC מ-Meta (אם App Secret מוגדר)
+    if WHATSAPP_APP_SECRET:
+        signature = request.headers.get("X-Hub-Signature-256", "")
+        if not _verify_signature(request.get_data(), signature):
+            logger.warning("WhatsApp webhook signature verification failed")
+            return "Forbidden", 403
+
     data = request.get_json(silent=True)
     if not data:
         return jsonify({"status": "no data"}), 400
@@ -55,6 +64,20 @@ def receive_message():
     thread.start()
 
     return jsonify({"status": "ok"}), 200
+
+
+def _verify_signature(payload: bytes, signature_header: str) -> bool:
+    """אימות חתימת HMAC-SHA256 מ-Meta על ה-payload.
+
+    Meta שולח את החתימה ב-header X-Hub-Signature-256 בפורמט sha256=<hex>.
+    """
+    if not signature_header.startswith("sha256="):
+        return False
+    expected_sig = signature_header[7:]  # הסרת prefix "sha256="
+    computed = hmac.new(
+        WHATSAPP_APP_SECRET.encode(), payload, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(computed, expected_sig)
 
 
 def _process_webhook_safe(data: dict) -> None:

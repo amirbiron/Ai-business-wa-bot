@@ -34,6 +34,10 @@ WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
 WHATSAPP_BUSINESS_ACCOUNT_ID = os.getenv("WHATSAPP_BUSINESS_ACCOUNT_ID", "")
+# App Secret מ-Meta — נדרש לאימות חתימת HMAC על webhook payloads
+WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "")
+# שם תבנית (template) מאושרת ב-Meta — נדרש לשליחת broadcast בוואטסאפ
+WHATSAPP_BROADCAST_TEMPLATE = os.getenv("WHATSAPP_BROADCAST_TEMPLATE", "")
 # מספר הטלפון של בעל העסק לקבלת התראות בוואטסאפ (אופציונלי)
 WHATSAPP_OWNER_PHONE = os.getenv("WHATSAPP_OWNER_PHONE", "")
 

@@ -2,6 +2,8 @@
 טסטים ל-WhatsApp webhook endpoint — אימות ופירוק payload.
 """
 
+import hashlib
+import hmac
 import json
 from unittest.mock import patch, MagicMock, ANY
 import pytest
@@ -153,6 +155,66 @@ class TestWebhookReceive:
             }
             ww._process_webhook_payload(payload)
             mock_msg.assert_not_called()
+
+
+class TestSignatureVerification:
+    """בדיקות אימות חתימת HMAC מ-Meta."""
+
+    def test_valid_signature_passes(self, client):
+        """כש-WHATSAPP_APP_SECRET מוגדר וחתימה תואמת — מעבד את ההודעה."""
+        secret = "test-app-secret"
+        payload = json.dumps(_build_text_payload("972501234567", "שלום")).encode()
+        sig = "sha256=" + hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+
+        with patch.object(ww, "WHATSAPP_APP_SECRET", secret), \
+             patch.object(ww.threading, "Thread") as mock_thread:
+            mock_thread.return_value = MagicMock()
+            resp = client.post(
+                "/webhook/whatsapp",
+                data=payload,
+                content_type="application/json",
+                headers={"X-Hub-Signature-256": sig},
+            )
+            assert resp.status_code == 200
+            mock_thread.return_value.start.assert_called_once()
+
+    def test_invalid_signature_rejected(self, client):
+        """חתימה שגויה — מחזיר 403."""
+        secret = "test-app-secret"
+        payload = json.dumps(_build_text_payload("972501234567", "שלום")).encode()
+
+        with patch.object(ww, "WHATSAPP_APP_SECRET", secret):
+            resp = client.post(
+                "/webhook/whatsapp",
+                data=payload,
+                content_type="application/json",
+                headers={"X-Hub-Signature-256": "sha256=bad_signature"},
+            )
+            assert resp.status_code == 403
+
+    def test_missing_signature_rejected(self, client):
+        """ללא header חתימה כש-secret מוגדר — מחזיר 403."""
+        with patch.object(ww, "WHATSAPP_APP_SECRET", "test-app-secret"):
+            payload = json.dumps(_build_text_payload("972501234567", "שלום")).encode()
+            resp = client.post(
+                "/webhook/whatsapp",
+                data=payload,
+                content_type="application/json",
+            )
+            assert resp.status_code == 403
+
+    def test_no_secret_skips_verification(self, client):
+        """כש-WHATSAPP_APP_SECRET ריק — לא בודק חתימה (תאימות לאחור)."""
+        with patch.object(ww, "WHATSAPP_APP_SECRET", ""), \
+             patch.object(ww.threading, "Thread") as mock_thread:
+            mock_thread.return_value = MagicMock()
+            payload = json.dumps(_build_text_payload("972501234567", "שלום")).encode()
+            resp = client.post(
+                "/webhook/whatsapp",
+                data=payload,
+                content_type="application/json",
+            )
+            assert resp.status_code == 200
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

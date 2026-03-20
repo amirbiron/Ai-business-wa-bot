@@ -9,7 +9,7 @@ appointment_notifications — התראות סטטוס אוטומטיות לתו�
 
 import logging
 
-from live_chat_service import send_telegram_message
+from live_chat_service import send_message_to_user
 from config import BUSINESS_NAME
 
 logger = logging.getLogger(__name__)
@@ -63,7 +63,7 @@ _MESSAGE_BUILDERS = {
 
 
 def notify_appointment_status(appt: dict, owner_message: str = "") -> bool:
-    """שליחת התראת סטטוס תור ללקוח בטלגרם.
+    """שליחת התראת סטטוס תור ללקוח (טלגרם או וואטסאפ — לפי prefix של user_id).
 
     Parameters
     ----------
@@ -102,7 +102,7 @@ def notify_appointment_status(appt: dict, owner_message: str = "") -> bool:
         owner_message=owner_message.strip(),
     )
 
-    success = send_telegram_message(user_id, text)
+    success = send_message_to_user(user_id, text)
     if success:
         logger.info(
             "Sent %s notification to user %s for appointment #%s",

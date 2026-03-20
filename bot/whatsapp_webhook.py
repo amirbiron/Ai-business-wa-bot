@@ -3,9 +3,11 @@ WhatsApp Webhook — Flask Blueprint לקבלת הודעות מ-Meta Cloud API.
 
 Meta שולח הודעות נכנסות ל-POST /webhook/whatsapp.
 אימות Webhook נעשה דרך GET /webhook/whatsapp עם verify_token.
+עיבוד ההודעות מתבצע ב-thread נפרד כדי להחזיר 200 מיד ל-Meta.
 """
 
 import logging
+import threading
 
 from flask import Blueprint, request, jsonify
 
@@ -35,19 +37,32 @@ def verify_webhook():
 def receive_message():
     """קבלת הודעות נכנסות מ-WhatsApp Cloud API.
 
-    מחזיר 200 מיד (Meta דורש תשובה תוך 20 שניות) ומעבד ברקע.
+    מחזיר 200 מיד ומעביר את העיבוד ל-thread ברקע.
+    Meta דורש תשובה תוך ~20 שניות — בלי thread, ה-RAG+LLM pipeline
+    יכול לחרוג מהזמן ולגרום ל-retry ועיבוד כפול.
     """
     data = request.get_json(silent=True)
     if not data:
         return jsonify({"status": "no data"}), 400
 
+    # עיבוד ב-thread נפרד — מחזירים 200 מיד ל-Meta כדי להימנע מ-retry
+    # (ה-RAG+LLM pipeline יכול לקחת 5-15 שניות, וה-timeout של Meta הוא ~20 שניות)
+    thread = threading.Thread(
+        target=_process_webhook_safe,
+        args=(data,),
+        daemon=True,
+    )
+    thread.start()
+
+    return jsonify({"status": "ok"}), 200
+
+
+def _process_webhook_safe(data: dict) -> None:
+    """עטיפת _process_webhook_payload עם try/except — לשימוש ב-thread."""
     try:
         _process_webhook_payload(data)
     except Exception as e:
-        # לוגים בלבד — תמיד מחזירים 200 ל-Meta כדי לא לגרום ל-retry storm
         logger.error("WhatsApp webhook processing error: %s", e, exc_info=True)
-
-    return jsonify({"status": "ok"}), 200
 
 
 def _process_webhook_payload(data: dict) -> None:

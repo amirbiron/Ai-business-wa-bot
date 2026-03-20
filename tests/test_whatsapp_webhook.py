@@ -90,7 +90,10 @@ class TestWebhookReceive:
         assert resp.status_code == 400
 
     def test_text_message_dispatched(self, client):
-        with patch.object(ww, "_process_webhook_payload") as mock_process:
+        """POST מחזיר 200 ומעביר עיבוד ל-thread ברקע."""
+        with patch.object(ww, "_process_webhook_safe") as mock_safe, \
+             patch.object(ww.threading, "Thread") as mock_thread:
+            mock_thread.return_value = MagicMock()
             payload = _build_text_payload("972501234567", "שלום")
             resp = client.post(
                 "/webhook/whatsapp",
@@ -98,11 +101,13 @@ class TestWebhookReceive:
                 content_type="application/json",
             )
             assert resp.status_code == 200
-            mock_process.assert_called_once()
+            mock_thread.assert_called_once()
+            mock_thread.return_value.start.assert_called_once()
 
-    def test_processing_error_still_returns_200(self, client):
-        """Meta דורש 200 — גם אם העיבוד נכשל."""
-        with patch.object(ww, "_process_webhook_payload", side_effect=RuntimeError("boom")):
+    def test_always_returns_200(self, client):
+        """Meta דורש 200 — תמיד, כי העיבוד קורה ב-thread נפרד."""
+        with patch.object(ww.threading, "Thread") as mock_thread:
+            mock_thread.return_value = MagicMock()
             payload = _build_text_payload("972501234567", "שלום")
             resp = client.post(
                 "/webhook/whatsapp",
@@ -125,6 +130,12 @@ class TestWebhookReceive:
                 message_id="wamid.test123",
                 display_name="Test User",
             )
+
+    def test_process_webhook_safe_catches_errors(self):
+        """_process_webhook_safe לוכדת שגיאות ורושמת ללוג."""
+        with patch.object(ww, "_process_webhook_payload", side_effect=RuntimeError("boom")):
+            # לא צריך לזרוק — השגיאה נתפסת ונרשמת ללוג
+            ww._process_webhook_safe({"entry": []})
 
     def test_process_status_ignored(self):
         """סטטוסי הודעות (delivered/read) מדולגים."""

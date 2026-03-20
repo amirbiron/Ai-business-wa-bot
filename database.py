@@ -1,0 +1,1784 @@
+"""
+Database module — SQLite storage for knowledge base, conversations, and notifications.
+"""
+
+import logging
+import sqlite3
+import json
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+from ai_chatbot.config import DB_PATH, TONE_DEFINITIONS
+
+
+@contextmanager
+def get_connection():
+    """Yield a SQLite connection and always close it safely."""
+    # הבוט (asyncio) והאדמין (Flask) רצים באותו תהליך. נוצר חיבור חדש לכל
+    # פעולה, עם timeout נדיב ו-busy_timeout כדי לצמצם שגיאות "database is locked".
+    # check_same_thread=False נדרש כי Flask ו-asyncio משתמשים ב-threads שונים,
+    # אבל ה-connection עצמו *אינו* thread-safe — השימוש הבטוח מובטח ע"י
+    # context manager שפותח וסוגר חיבור בכל פעולה (ללא שיתוף בין threads).
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def init_db():
+    """Create all tables if they don't exist."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.executescript("""
+            -- Knowledge Base entries
+            CREATE TABLE IF NOT EXISTS kb_entries (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                category    TEXT NOT NULL,
+                title       TEXT NOT NULL,
+                content     TEXT NOT NULL,
+                metadata    TEXT DEFAULT '{}',
+                is_active   INTEGER DEFAULT 1,
+                created_at  TEXT DEFAULT (datetime('now')),
+                updated_at  TEXT DEFAULT (datetime('now'))
+            );
+
+            -- Chunked versions for RAG
+            CREATE TABLE IF NOT EXISTS kb_chunks (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_id    INTEGER NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                chunk_text  TEXT NOT NULL,
+                embedding   BLOB,
+                created_at  TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY (entry_id) REFERENCES kb_entries(id) ON DELETE CASCADE
+            );
+
+            -- Conversation history
+            CREATE TABLE IF NOT EXISTS conversations (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     TEXT NOT NULL,
+                username    TEXT DEFAULT '',
+                role        TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+                message     TEXT NOT NULL,
+                sources     TEXT DEFAULT '',
+                created_at  TEXT DEFAULT (datetime('now'))
+            );
+
+            -- Agent transfer notifications
+            CREATE TABLE IF NOT EXISTS agent_requests (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     TEXT NOT NULL,
+                username    TEXT DEFAULT '',
+                telegram_username TEXT DEFAULT '',
+                message     TEXT DEFAULT '',
+                status      TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'handled', 'dismissed')),
+                created_at  TEXT DEFAULT (datetime('now')),
+                handled_at  TEXT
+            );
+
+            -- Appointment bookings
+            CREATE TABLE IF NOT EXISTS appointments (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     TEXT NOT NULL,
+                username    TEXT DEFAULT '',
+                telegram_username TEXT DEFAULT '',
+                service     TEXT DEFAULT '',
+                preferred_date TEXT DEFAULT '',
+                preferred_time TEXT DEFAULT '',
+                notes       TEXT DEFAULT '',
+                status      TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'confirmed', 'cancelled')),
+                created_at  TEXT DEFAULT (datetime('now'))
+            );
+
+            -- Conversation summaries for long-term memory
+            CREATE TABLE IF NOT EXISTS conversation_summaries (
+                id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id                     TEXT NOT NULL,
+                summary_text                TEXT NOT NULL,
+                message_count               INTEGER NOT NULL DEFAULT 0,
+                last_summarized_message_id  INTEGER NOT NULL DEFAULT 0,
+                created_at                  TEXT DEFAULT (datetime('now'))
+            );
+
+            -- Live chat sessions (business owner takes over a conversation)
+            CREATE TABLE IF NOT EXISTS live_chats (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     TEXT NOT NULL,
+                username    TEXT DEFAULT '',
+                is_active   INTEGER DEFAULT 1,
+                started_at  TEXT DEFAULT (datetime('now')),
+                updated_at  TEXT DEFAULT (datetime('now')),
+                ended_at    TEXT
+            );
+
+            -- Unanswered questions (knowledge gaps)
+            CREATE TABLE IF NOT EXISTS unanswered_questions (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     TEXT NOT NULL,
+                username    TEXT DEFAULT '',
+                question    TEXT NOT NULL,
+                status      TEXT DEFAULT 'open' CHECK(status IN ('open', 'resolved')),
+                created_at  TEXT DEFAULT (datetime('now')),
+                resolved_at TEXT
+            );
+
+            -- Business hours (weekly schedule)
+            CREATE TABLE IF NOT EXISTS business_hours (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                day_of_week INTEGER NOT NULL CHECK(day_of_week BETWEEN 0 AND 6),
+                open_time   TEXT,
+                close_time  TEXT,
+                is_closed   INTEGER DEFAULT 0,
+                UNIQUE(day_of_week)
+            );
+
+            -- Special days (holidays, one-time closures, custom hours)
+            CREATE TABLE IF NOT EXISTS special_days (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                date        TEXT NOT NULL UNIQUE,
+                name        TEXT NOT NULL,
+                open_time   TEXT,
+                close_time  TEXT,
+                is_closed   INTEGER DEFAULT 1,
+                notes       TEXT DEFAULT '',
+                created_at  TEXT DEFAULT (datetime('now'))
+            );
+
+            -- Referral codes (קוד הפניה קבוע לכל משתמש)
+            CREATE TABLE IF NOT EXISTS referral_codes (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id         TEXT NOT NULL UNIQUE,
+                code            TEXT NOT NULL UNIQUE,
+                sent            INTEGER DEFAULT 0,
+                created_at      TEXT DEFAULT (datetime('now'))
+            );
+
+            -- Referrals (כל הפניה בודדת)
+            CREATE TABLE IF NOT EXISTS referrals (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                referrer_id     TEXT NOT NULL,
+                referred_id     TEXT NOT NULL UNIQUE,
+                code            TEXT NOT NULL,
+                status          TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'completed')),
+                created_at      TEXT DEFAULT (datetime('now')),
+                completed_at    TEXT
+            );
+
+            -- Referral credits (זיכויים מהפניות)
+            CREATE TABLE IF NOT EXISTS credits (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id         TEXT NOT NULL,
+                amount          REAL NOT NULL,
+                type            TEXT NOT NULL CHECK(type IN ('referrer', 'referred')),
+                reason          TEXT DEFAULT '',
+                used            INTEGER DEFAULT 0,
+                expires_at      TEXT NOT NULL,
+                created_at      TEXT DEFAULT (datetime('now'))
+            );
+
+            -- Broadcast messages (הודעות יזומות)
+            CREATE TABLE IF NOT EXISTS broadcast_messages (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_text    TEXT NOT NULL,
+                audience        TEXT NOT NULL DEFAULT 'all' CHECK(audience IN ('all', 'booked', 'recent')),
+                total_recipients INTEGER DEFAULT 0,
+                sent_count      INTEGER DEFAULT 0,
+                failed_count    INTEGER DEFAULT 0,
+                status          TEXT DEFAULT 'queued' CHECK(status IN ('queued', 'sending', 'completed', 'failed')),
+                created_at      TEXT DEFAULT (datetime('now')),
+                completed_at    TEXT
+            );
+
+            -- User subscription status (הרשמה/ביטול הרשמה לשידורים)
+            CREATE TABLE IF NOT EXISTS user_subscriptions (
+                user_id         TEXT NOT NULL PRIMARY KEY,
+                is_subscribed   INTEGER DEFAULT 1,
+                updated_at      TEXT DEFAULT (datetime('now'))
+            );
+
+            -- Vacation mode (שורה בודדת — תמיד id=1)
+            CREATE TABLE IF NOT EXISTS vacation_mode (
+                id                  INTEGER PRIMARY KEY CHECK(id = 1),
+                is_active           INTEGER DEFAULT 0,
+                vacation_end_date   TEXT DEFAULT '',
+                vacation_message    TEXT DEFAULT '',
+                updated_at          TEXT DEFAULT (datetime('now'))
+            );
+            INSERT OR IGNORE INTO vacation_mode (id) VALUES (1);
+
+            -- הגדרות בוט — טון תקשורת וביטויים מותאמים (שורה בודדת — תמיד id=1)
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                id              INTEGER PRIMARY KEY CHECK(id = 1),
+                tone            TEXT NOT NULL DEFAULT 'friendly'
+                                    CHECK(tone IN ('friendly', 'formal', 'sales', 'luxury')),
+                custom_phrases  TEXT DEFAULT '',
+                updated_at      TEXT DEFAULT (datetime('now'))
+            );
+            INSERT OR IGNORE INTO bot_settings (id) VALUES (1);
+
+            -- Create indexes
+            CREATE INDEX IF NOT EXISTS idx_kb_entries_category ON kb_entries(category);
+            CREATE INDEX IF NOT EXISTS idx_kb_chunks_entry ON kb_chunks(entry_id);
+            CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id);
+            CREATE INDEX IF NOT EXISTS idx_conversations_user_created ON conversations(user_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_agent_requests_status ON agent_requests(status);
+            CREATE INDEX IF NOT EXISTS idx_conversation_summaries_user ON conversation_summaries(user_id);
+            CREATE INDEX IF NOT EXISTS idx_live_chats_user_active ON live_chats(user_id, is_active);
+            CREATE INDEX IF NOT EXISTS idx_unanswered_questions_status ON unanswered_questions(status);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_special_days_date_unique ON special_days(date);
+            CREATE INDEX IF NOT EXISTS idx_referral_codes_user ON referral_codes(user_id);
+            CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id);
+            CREATE INDEX IF NOT EXISTS idx_referrals_referred ON referrals(referred_id);
+            CREATE INDEX IF NOT EXISTS idx_referrals_code ON referrals(code);
+            CREATE INDEX IF NOT EXISTS idx_credits_user ON credits(user_id);
+            CREATE INDEX IF NOT EXISTS idx_broadcast_status ON broadcast_messages(status);
+        """)
+
+        # מיגרציות קלות — הלוגיקה בקובץ נפרד לקריאות טובה יותר
+        from migrations import run_migrations
+        run_migrations(conn)
+
+
+def end_expired_live_chats(max_hours: int = 4) -> int:
+    """סגירת sessions שלא עודכנו במשך max_hours שעות.
+
+    מחזיר את מספר ה-sessions שנסגרו.
+    """
+    with get_connection() as conn:
+        expired = conn.execute(
+            """SELECT COUNT(*) AS cnt FROM live_chats
+               WHERE is_active = 1
+                 AND datetime(COALESCE(updated_at, started_at), '+' || ? || ' hours') < datetime('now')""",
+            (max_hours,),
+        ).fetchone()["cnt"]
+        if expired:
+            conn.execute(
+                """UPDATE live_chats SET is_active = 0, ended_at = datetime('now')
+                   WHERE is_active = 1
+                     AND datetime(COALESCE(updated_at, started_at), '+' || ? || ' hours') < datetime('now')""",
+                (max_hours,),
+            )
+            logger.info("Auto-closed %d expired live chat session(s) (inactive > %d hours).", expired, max_hours)
+        return expired
+
+
+def cleanup_stale_live_chats():
+    """Deactivate live chat sessions left over from a previous bot run.
+
+    Called from the bot startup path only — not from init_db() — so that
+    a bot-only restart doesn't silently end sessions still managed by
+    the admin panel running in a separate process.
+    """
+    with get_connection() as conn:
+        stale = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM live_chats WHERE is_active = 1"
+        ).fetchone()["cnt"]
+        if stale:
+            conn.execute(
+                "UPDATE live_chats SET is_active = 0, ended_at = datetime('now') WHERE is_active = 1"
+            )
+            logger.info("Cleaned up %d stale live chat session(s) from previous run.", stale)
+
+
+# ─── Knowledge Base CRUD ─────────────────────────────────────────────────────
+
+def add_kb_entry(category: str, title: str, content: str, metadata: dict = None) -> int:
+    """Add a new knowledge base entry. Returns the entry ID."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO kb_entries (category, title, content, metadata) VALUES (?, ?, ?, ?)",
+            (category, title, content, json.dumps(metadata or {}))
+        )
+        return cursor.lastrowid
+
+
+def update_kb_entry(entry_id: int, category: str, title: str, content: str, metadata: dict = None):
+    """Update an existing knowledge base entry."""
+    with get_connection() as conn:
+        conn.execute(
+            """UPDATE kb_entries 
+               SET category=?, title=?, content=?, metadata=?, updated_at=datetime('now') 
+               WHERE id=?""",
+            (category, title, content, json.dumps(metadata or {}), entry_id)
+        )
+
+
+def delete_kb_entry(entry_id: int):
+    """Delete a knowledge base entry and its chunks."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM kb_entries WHERE id=?", (entry_id,))
+
+
+def get_kb_entry(entry_id: int) -> Optional[dict]:
+    """Get a single KB entry by ID."""
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM kb_entries WHERE id=?", (entry_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_all_kb_entries(category: str = None, active_only: bool = True) -> list[dict]:
+    """Get all KB entries, optionally filtered by category."""
+    with get_connection() as conn:
+        query = "SELECT * FROM kb_entries WHERE 1=1"
+        params = []
+        if active_only:
+            query += " AND is_active=1"
+        if category:
+            query += " AND category=?"
+            params.append(category)
+        query += " ORDER BY category, title"
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_kb_categories() -> list[str]:
+    """Get distinct categories from the knowledge base."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT category FROM kb_entries WHERE is_active=1 ORDER BY category"
+        ).fetchall()
+        return [r["category"] for r in rows]
+
+
+def count_kb_entries(category: str | None = None, active_only: bool = True) -> int:
+    """Count KB entries, optionally filtered by category."""
+    with get_connection() as conn:
+        query = "SELECT COUNT(*) AS count FROM kb_entries WHERE 1=1"
+        params: list[object] = []
+        if active_only:
+            query += " AND is_active=1"
+        if category:
+            query += " AND category=?"
+            params.append(category)
+        row = conn.execute(query, params).fetchone()
+        return int(row["count"]) if row else 0
+
+
+def count_kb_categories(active_only: bool = True) -> int:
+    """Count distinct KB categories."""
+    with get_connection() as conn:
+        if active_only:
+            row = conn.execute(
+                "SELECT COUNT(DISTINCT category) AS count FROM kb_entries WHERE is_active=1"
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COUNT(DISTINCT category) AS count FROM kb_entries"
+            ).fetchone()
+        return int(row["count"]) if row else 0
+
+
+# ─── Chunks ──────────────────────────────────────────────────────────────────
+
+def save_chunks(entry_id: int, chunks: list[dict]):
+    """Save chunks for a KB entry (replaces existing chunks)."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM kb_chunks WHERE entry_id=?", (entry_id,))
+        conn.executemany(
+            "INSERT INTO kb_chunks (entry_id, chunk_index, chunk_text, embedding) VALUES (?, ?, ?, ?)",
+            [(entry_id, c["index"], c["text"], c.get("embedding")) for c in chunks],
+        )
+
+
+def get_all_chunks() -> list[dict]:
+    """Get all chunks with their entry info for building the FAISS index."""
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT c.id, c.entry_id, c.chunk_index, c.chunk_text, c.embedding,
+                   e.category, e.title
+            FROM kb_chunks c
+            JOIN kb_entries e ON c.entry_id = e.id
+            WHERE e.is_active = 1
+            ORDER BY c.id
+        """).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_chunks_for_entries(entry_ids: list[int]) -> dict[int, list[dict]]:
+    """Get existing chunks (with embeddings) grouped by entry_id.
+
+    Only returns chunks whose embedding is not NULL, suitable for reuse
+    during incremental index rebuilds.
+    """
+    if not entry_ids:
+        return {}
+    with get_connection() as conn:
+        placeholders = ",".join("?" for _ in entry_ids)
+        rows = conn.execute(
+            f"""SELECT c.id, c.entry_id, c.chunk_index, c.chunk_text, c.embedding,
+                       e.category, e.title
+                FROM kb_chunks c
+                JOIN kb_entries e ON c.entry_id = e.id
+                WHERE c.entry_id IN ({placeholders}) AND c.embedding IS NOT NULL
+                ORDER BY c.entry_id, c.chunk_index""",
+            entry_ids,
+        ).fetchall()
+        result: dict[int, list[dict]] = {}
+        for r in rows:
+            d = dict(r)
+            result.setdefault(d["entry_id"], []).append(d)
+        return result
+
+
+# ─── Conversations ───────────────────────────────────────────────────────────
+
+def save_message(user_id: str, username: str, role: str, message: str, sources: str = ""):
+    """Save a conversation message."""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO conversations (user_id, username, role, message, sources) VALUES (?, ?, ?, ?, ?)",
+            (user_id, username, role, message, sources)
+        )
+
+
+def get_conversation_history(user_id: str, limit: int = 20) -> list[dict]:
+    """Get recent conversation history for a user."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT role, username, message, sources, created_at
+               FROM conversations WHERE user_id=?
+               ORDER BY id DESC LIMIT ?""",
+            (user_id, limit)
+        ).fetchall()
+        return [dict(r) for r in reversed(rows)]
+
+
+def get_all_conversations(limit: int = 100) -> list[dict]:
+    """Get all conversations for the admin panel."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT user_id, username, role, message, sources, created_at 
+               FROM conversations ORDER BY id DESC LIMIT ?""",
+            (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_unique_users() -> list[dict]:
+    """Get list of unique users with their last message time."""
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT user_id, username,
+                   MAX(created_at) as last_active,
+                   COUNT(*) as message_count
+            FROM conversations
+            GROUP BY user_id
+            ORDER BY last_active DESC
+        """).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_username_for_user(user_id: str) -> Optional[str]:
+    """Look up the display name for a single user without scanning all users."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT username FROM conversations WHERE user_id = ? AND username != '' "
+            "ORDER BY id DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        return row["username"] if row else None
+
+
+def _last_summarized_message_id(conn, user_id: str) -> int:
+    """Return the highest conversation id already covered by a summary (0 if none)."""
+    row = conn.execute(
+        "SELECT COALESCE(MAX(last_summarized_message_id), 0) AS last_id "
+        "FROM conversation_summaries WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    return int(row["last_id"])
+
+
+def get_unsummarized_message_count(user_id: str) -> int:
+    """Count messages for a user that haven't been included in any summary yet.
+
+    Uses `last_summarized_message_id` so the count stays correct even when
+    older messages are deleted.
+    """
+    with get_connection() as conn:
+        last_id = _last_summarized_message_id(conn, user_id)
+
+        row = conn.execute(
+            "SELECT COUNT(*) AS count FROM conversations "
+            "WHERE user_id = ? AND id > ?",
+            (user_id, last_id),
+        ).fetchone()
+        return int(row["count"])
+
+
+def get_messages_for_summarization(user_id: str, limit: int) -> list[dict]:
+    """Get the oldest unsummarized messages for a user (to create a summary from).
+
+    Returns up to *limit* messages whose ``id`` is greater than the
+    ``last_summarized_message_id`` stored in the latest summary.
+    Each returned dict includes the conversation row ``id`` so that
+    :func:`save_conversation_summary` can record the new high-water mark.
+    """
+    with get_connection() as conn:
+        last_id = _last_summarized_message_id(conn, user_id)
+
+        rows = conn.execute(
+            """SELECT id, role, message, created_at
+               FROM conversations WHERE user_id = ? AND id > ?
+               ORDER BY id ASC LIMIT ?""",
+            (user_id, last_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def save_conversation_summary(
+    user_id: str,
+    summary_text: str,
+    message_count: int,
+    last_summarized_message_id: int = 0,
+):
+    """
+    Save a conversation summary for a user.
+
+    Replaces all previous summaries with a single merged summary.
+    ``last_summarized_message_id`` is the ``conversations.id`` of the newest
+    message included in this summary — subsequent queries use it as a
+    high-water mark so that counting stays correct even when rows are deleted.
+    ``message_count`` is accumulated for informational / admin-display purposes.
+    """
+    with get_connection() as conn:
+        # Accumulate total message count from existing summaries
+        row = conn.execute(
+            "SELECT COALESCE(SUM(message_count), 0) AS total FROM conversation_summaries WHERE user_id=?",
+            (user_id,)
+        ).fetchone()
+        total_message_count = int(row["total"]) + message_count
+
+        # If no explicit high-water mark was given, keep the previous one
+        if not last_summarized_message_id:
+            last_summarized_message_id = _last_summarized_message_id(conn, user_id)
+
+        # Replace all previous summaries with the new merged one
+        conn.execute("DELETE FROM conversation_summaries WHERE user_id=?", (user_id,))
+        conn.execute(
+            "INSERT INTO conversation_summaries "
+            "(user_id, summary_text, message_count, last_summarized_message_id) "
+            "VALUES (?, ?, ?, ?)",
+            (user_id, summary_text, total_message_count, last_summarized_message_id),
+        )
+
+
+def get_latest_summary(user_id: str) -> dict | None:
+    """Get the latest (single) conversation summary for a user."""
+    with get_connection() as conn:
+        row = conn.execute(
+            """SELECT summary_text, message_count, last_summarized_message_id, created_at
+               FROM conversation_summaries WHERE user_id=?
+               ORDER BY id DESC LIMIT 1""",
+            (user_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def count_unique_users() -> int:
+    """Count distinct users in conversation history."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(DISTINCT user_id) AS count FROM conversations"
+        ).fetchone()
+        return int(row["count"]) if row else 0
+
+
+# ─── Agent Requests ──────────────────────────────────────────────────────────
+
+def create_agent_request(
+    user_id: str,
+    username: str,
+    message: str = "",
+    telegram_username: str = "",
+) -> int:
+    """Create a new agent transfer request."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO agent_requests (user_id, username, telegram_username, message) VALUES (?, ?, ?, ?)",
+            (user_id, username, telegram_username or "", message)
+        )
+        return cursor.lastrowid
+
+
+def _status_filter_query(
+    table: str,
+    columns: str,
+    status: str | None,
+    limit: int | None,
+    order: str | None = None,
+) -> tuple[str, list[object]]:
+    """בניית שאילתת SELECT עם סינון סטטוס אופציונלי — helper משותף ל-get/count.
+
+    order=None דולג (מתאים ל-COUNT), order="created_at DESC" ממיין (מתאים ל-SELECT *).
+    """
+    params: list[object] = []
+    query = f"SELECT {columns} FROM {table}"
+    if status:
+        query += " WHERE status=?"
+        params.append(status)
+    if order:
+        query += f" ORDER BY {order}"
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
+    return query, params
+
+
+def get_agent_requests(status: str | None = None, limit: int | None = None) -> list[dict]:
+    """Get agent requests, optionally filtered by status."""
+    query, params = _status_filter_query("agent_requests", "*", status, limit, order="created_at DESC")
+    with get_connection() as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+def count_agent_requests(status: str | None = None) -> int:
+    """Count agent requests, optionally filtered by status."""
+    query, params = _status_filter_query("agent_requests", "COUNT(*) AS count", status, limit=None)
+    with get_connection() as conn:
+        row = conn.execute(query, params).fetchone()
+        return int(row["count"]) if row else 0
+
+
+def update_agent_request_status(request_id: int, status: str):
+    """Update the status of an agent request."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE agent_requests SET status=?, handled_at=datetime('now') WHERE id=?",
+            (status, request_id)
+        )
+
+
+def get_agent_request(request_id: int) -> Optional[dict]:
+    """Get a single agent request by ID."""
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM agent_requests WHERE id=?", (request_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def handle_pending_requests_for_user(user_id: str) -> int:
+    """סגירת כל בקשות הנציג הממתינות עבור משתמש — נקרא כשנכנסים לשיחה חיה."""
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "UPDATE agent_requests SET status='handled', handled_at=datetime('now') "
+            "WHERE user_id=? AND status='pending'",
+            (user_id,),
+        )
+        return cursor.rowcount
+
+
+# ─── Appointments ────────────────────────────────────────────────────────────
+
+def create_appointment(
+    user_id: str,
+    username: str,
+    service: str = "",
+    preferred_date: str = "",
+    preferred_time: str = "",
+    notes: str = "",
+    telegram_username: str = "",
+) -> int:
+    """Create a new appointment booking."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT INTO appointments (user_id, username, telegram_username, service, preferred_date, preferred_time, notes)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, username, telegram_username or "", service, preferred_date, preferred_time, notes)
+        )
+        return cursor.lastrowid
+
+
+def get_appointments(status: str | None = None, limit: int | None = None) -> list[dict]:
+    """Get appointments, optionally filtered by status."""
+    query, params = _status_filter_query("appointments", "*", status, limit, order="created_at DESC")
+    with get_connection() as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+def count_appointments(status: str | None = None) -> int:
+    """Count appointments, optionally filtered by status."""
+    query, params = _status_filter_query("appointments", "COUNT(*) AS count", status, limit=None)
+    with get_connection() as conn:
+        row = conn.execute(query, params).fetchone()
+        return int(row["count"]) if row else 0
+
+
+def update_appointment_status(appt_id: int, status: str):
+    """Update appointment status."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE appointments SET status=? WHERE id=?",
+            (status, appt_id)
+        )
+
+
+def get_appointment(appt_id: int) -> Optional[dict]:
+    """Get a single appointment by ID."""
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM appointments WHERE id=?", (appt_id,)).fetchone()
+        return dict(row) if row else None
+
+
+# ─── Live Chats ─────────────────────────────────────────────────────────────
+
+def start_live_chat(user_id: str, username: str = "") -> int:
+    """Start a live chat session for a user. Returns the session ID."""
+    with get_connection() as conn:
+        # End any existing active session for this user first
+        conn.execute(
+            "UPDATE live_chats SET is_active=0, ended_at=datetime('now') WHERE user_id=? AND is_active=1",
+            (user_id,)
+        )
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO live_chats (user_id, username) VALUES (?, ?)",
+            (user_id, username)
+        )
+        return cursor.lastrowid
+
+
+def touch_live_chat(user_id: str) -> None:
+    """עדכון זמן הפעילות האחרונה של שיחה חיה — למניעת timeout על שיחות פעילות."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE live_chats SET updated_at = datetime('now') WHERE user_id = ? AND is_active = 1",
+            (user_id,),
+        )
+
+
+def end_live_chat(user_id: str):
+    """End the active live chat session for a user."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE live_chats SET is_active=0, ended_at=datetime('now') WHERE user_id=? AND is_active=1",
+            (user_id,)
+        )
+
+
+def get_active_live_chat(user_id: str) -> Optional[dict]:
+    """Get the active live chat session for a user, or None."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM live_chats WHERE user_id=? AND is_active=1 ORDER BY id DESC LIMIT 1",
+            (user_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def is_live_chat_active(user_id: str) -> bool:
+    """Check if a user has an active live chat session."""
+    return get_active_live_chat(user_id) is not None
+
+
+def get_all_active_live_chats() -> list[dict]:
+    """Get all currently active live chat sessions."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM live_chats WHERE is_active=1 ORDER BY started_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def count_active_live_chats() -> int:
+    """Count currently active live chat sessions."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS count FROM live_chats WHERE is_active=1"
+        ).fetchone()
+        return int(row["count"]) if row else 0
+
+
+def get_live_chat_latest_user_messages() -> list[dict]:
+    """החזרת ההודעה האחרונה מכל לקוח בשיחה חיה פעילה — לצורך התראות באדמין."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT lc.user_id, lc.username,
+                      c.message AS last_message, c.created_at AS last_message_at
+               FROM live_chats lc
+               LEFT JOIN conversations c ON c.id = (
+                   SELECT id FROM conversations
+                   WHERE user_id = lc.user_id AND role = 'user'
+                   ORDER BY id DESC LIMIT 1
+               )
+               WHERE lc.is_active = 1
+               ORDER BY c.created_at DESC"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ─── Unanswered Questions (Knowledge Gaps) ──────────────────────────────────
+
+def save_unanswered_question(user_id: str, username: str, question: str):
+    """Log a question that the bot could not answer (fallback triggered)."""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO unanswered_questions (user_id, username, question) VALUES (?, ?, ?)",
+            (user_id, username, question),
+        )
+
+
+def get_unanswered_questions(status: str | None = None, limit: int | None = None) -> list[dict]:
+    """Get unanswered questions, optionally filtered by status."""
+    query, params = _status_filter_query("unanswered_questions", "*", status, limit, order="created_at DESC")
+    with get_connection() as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+def count_unanswered_questions(status: str | None = None) -> int:
+    """Count unanswered questions, optionally filtered by status."""
+    query, params = _status_filter_query("unanswered_questions", "COUNT(*) AS count", status, limit=None)
+    with get_connection() as conn:
+        row = conn.execute(query, params).fetchone()
+        return int(row["count"]) if row else 0
+
+
+def update_unanswered_question_status(question_id: int, status: str):
+    """Update the status of an unanswered question."""
+    with get_connection() as conn:
+        resolved_at = "datetime('now')" if status == "resolved" else "NULL"
+        conn.execute(
+            f"UPDATE unanswered_questions SET status=?, resolved_at={resolved_at} WHERE id=?",
+            (status, question_id),
+        )
+
+
+def get_unanswered_question(question_id: int) -> Optional[dict]:
+    """Get a single unanswered question by ID."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM unanswered_questions WHERE id=?", (question_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+# ─── Dashboard Batch Query ─────────────────────────────────────────────────
+
+def get_dashboard_counts() -> dict[str, int]:
+    """שאילתה מאוחדת לכל מוני הדשבורד — מצמצם 6 שאילתות נפרדות לאחת."""
+    query = """
+        SELECT
+            (SELECT COUNT(*) FROM kb_entries WHERE is_active = 1) AS kb_entries,
+            (SELECT COUNT(DISTINCT category) FROM kb_entries WHERE is_active = 1) AS categories,
+            (SELECT COUNT(DISTINCT user_id) FROM conversations) AS users,
+            (SELECT COUNT(*) FROM agent_requests WHERE status = 'pending') AS pending_requests,
+            (SELECT COUNT(*) FROM appointments WHERE status = 'pending') AS pending_appointments,
+            (SELECT COUNT(*) FROM unanswered_questions WHERE status = 'open') AS open_knowledge_gaps
+    """
+    with get_connection() as conn:
+        row = conn.execute(query).fetchone()
+        return dict(row) if row else {}
+
+
+# ─── Business Hours ─────────────────────────────────────────────────────────
+
+def get_all_business_hours() -> list[dict]:
+    """Get all business hours entries, ordered by day of week."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM business_hours ORDER BY day_of_week"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_business_hours_for_day(day_of_week: int) -> Optional[dict]:
+    """Get business hours for a specific day of week (0=Sunday .. 6=Saturday)."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM business_hours WHERE day_of_week=?",
+            (day_of_week,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def upsert_business_hours(day_of_week: int, open_time: str, close_time: str, is_closed: bool):
+    """Insert or update business hours for a day of week."""
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT INTO business_hours (day_of_week, open_time, close_time, is_closed)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(day_of_week)
+               DO UPDATE SET open_time=excluded.open_time,
+                             close_time=excluded.close_time,
+                             is_closed=excluded.is_closed""",
+            (day_of_week, open_time, close_time, int(is_closed)),
+        )
+
+
+def seed_default_business_hours():
+    """Populate default business hours if table is empty."""
+    with get_connection() as conn:
+        count = conn.execute("SELECT COUNT(*) AS c FROM business_hours").fetchone()["c"]
+        if count > 0:
+            return
+        defaults = [
+            # day_of_week, open_time, close_time, is_closed
+            (0, "09:00", "19:00", 0),  # Sunday
+            (1, "09:00", "19:00", 0),  # Monday
+            (2, "09:00", "20:00", 0),  # Tuesday
+            (3, "09:00", "19:00", 0),  # Wednesday
+            (4, "09:00", "19:00", 0),  # Thursday
+            (5, "09:00", "14:00", 0),  # Friday
+            (6, None, None, 1),        # Saturday — closed
+        ]
+        conn.executemany(
+            "INSERT INTO business_hours (day_of_week, open_time, close_time, is_closed) VALUES (?, ?, ?, ?)",
+            defaults,
+        )
+
+
+# ─── Special Days (Holidays & Exceptions) ───────────────────────────────────
+
+def get_all_special_days() -> list[dict]:
+    """Get all special days, ordered by date."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM special_days ORDER BY date"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_special_day_by_date(date_str: str) -> Optional[dict]:
+    """Get a special day entry for a given date (YYYY-MM-DD)."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM special_days WHERE date=?", (date_str,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def add_special_day(
+    date_str: str,
+    name: str,
+    is_closed: bool = True,
+    open_time: str = None,
+    close_time: str = None,
+    notes: str = "",
+) -> int:
+    """Add or replace a special day for the given date. Returns the entry ID.
+
+    Uses INSERT OR REPLACE so that admin overrides for an existing date
+    (e.g. overriding a seeded holiday) take effect instead of silently
+    creating a duplicate.
+    """
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT OR REPLACE INTO special_days (date, name, open_time, close_time, is_closed, notes)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (date_str, name, open_time, close_time, int(is_closed), notes),
+        )
+        return cursor.lastrowid
+
+
+def update_special_day(
+    special_day_id: int,
+    date_str: str,
+    name: str,
+    is_closed: bool = True,
+    open_time: str = None,
+    close_time: str = None,
+    notes: str = "",
+):
+    """Update an existing special day."""
+    with get_connection() as conn:
+        conn.execute(
+            """UPDATE special_days
+               SET date=?, name=?, open_time=?, close_time=?, is_closed=?, notes=?
+               WHERE id=?""",
+            (date_str, name, open_time, close_time, int(is_closed), notes, special_day_id),
+        )
+
+
+def delete_special_day(special_day_id: int):
+    """Delete a special day entry."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM special_days WHERE id=?", (special_day_id,))
+
+
+# ─── Vacation Mode ──────────────────────────────────────────────────────────
+
+def get_vacation_mode() -> dict:
+    """קבלת מצב חופשה נוכחי. מחזיר dict עם is_active, vacation_end_date, vacation_message."""
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM vacation_mode WHERE id = 1").fetchone()
+        if row:
+            return dict(row)
+        # fallback — לא אמור לקרות כי init_db מכניס שורה
+        return {"id": 1, "is_active": 0, "vacation_end_date": "", "vacation_message": "", "updated_at": ""}
+
+
+def update_vacation_mode(is_active: bool, vacation_end_date: str = "", vacation_message: str = ""):
+    """עדכון הגדרות מצב חופשה."""
+    with get_connection() as conn:
+        conn.execute(
+            """UPDATE vacation_mode
+               SET is_active = ?, vacation_end_date = ?, vacation_message = ?,
+                   updated_at = datetime('now')
+               WHERE id = 1""",
+            (int(is_active), vacation_end_date, vacation_message),
+        )
+
+
+# ─── Bot Settings (הגדרות בוט — טון וביטויים) ─────────────────────────────
+
+# מקור אמת יחיד — נגזר מהגדרות הטון ב-config.py
+VALID_TONES = set(TONE_DEFINITIONS.keys())
+
+
+def get_bot_settings() -> dict:
+    """קבלת הגדרות הבוט — טון תקשורת וביטויים מותאמים."""
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM bot_settings WHERE id = 1").fetchone()
+        if row:
+            return dict(row)
+        # fallback — לא אמור לקרות כי init_db מכניס שורה
+        return {"id": 1, "tone": "friendly", "custom_phrases": "", "updated_at": ""}
+
+
+def update_bot_settings(tone: str, custom_phrases: str = ""):
+    """עדכון הגדרות הבוט — טון תקשורת וביטויים מותאמים."""
+    if tone not in VALID_TONES:
+        logger.error("Invalid tone value: %s", tone)
+        return
+    with get_connection() as conn:
+        conn.execute(
+            """UPDATE bot_settings
+               SET tone = ?, custom_phrases = ?, updated_at = datetime('now')
+               WHERE id = 1""",
+            (tone, custom_phrases),
+        )
+
+
+# ─── Referrals (מערכת הפניות) ────────────────────────────────────────────
+
+def generate_referral_code(user_id: str) -> str:
+    """יצירת קוד הפניה ייחודי למשתמש. אם כבר קיים — מחזיר את הקוד הקיים.
+
+    הקוד נשמר ב-referral_codes ונשאר קבוע — ניתן לשימוש חוזר עבור הפניות מרובות.
+    """
+    import hashlib
+
+    existing = get_user_referral_code(user_id)
+    if existing:
+        return existing
+
+    raw = f"{user_id}_{datetime.now().isoformat()}"
+    short_hash = hashlib.sha256(raw.encode()).hexdigest()[:8].upper()
+    code = f"REF_{short_hash}"
+
+    try:
+        with get_connection() as conn:
+            # וידוא ייחודיות (מקרה קצה נדיר של התנגשות)
+            while conn.execute("SELECT 1 FROM referral_codes WHERE code = ?", (code,)).fetchone():
+                raw += "_retry"
+                short_hash = hashlib.sha256(raw.encode()).hexdigest()[:8].upper()
+                code = f"REF_{short_hash}"
+
+            conn.execute(
+                "INSERT INTO referral_codes (user_id, code) VALUES (?, ?)",
+                (user_id, code),
+            )
+    except sqlite3.IntegrityError:
+        # race condition — תהליך אחר יצר קוד בו-זמנית
+        existing = get_user_referral_code(user_id)
+        if existing:
+            return existing
+        logger.error("Failed to generate referral code for user %s", user_id)
+        return ""
+
+    return code
+
+
+def get_referral_by_code(code: str) -> Optional[dict]:
+    """חיפוש קוד הפניה ב-referral_codes."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM referral_codes WHERE code = ?", (code,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def register_referral(code: str, referred_id: str) -> bool:
+    """רישום הפניה — יוצר רשומת הפניה חדשה המקשרת את המשתמש לקוד.
+
+    מחזיר True אם הרישום הצליח, False אם הקוד לא קיים,
+    המשתמש מנסה להפנות את עצמו, או שכבר הופנה ע"י מישהו.
+    """
+    with get_connection() as conn:
+        # חיפוש המפנה לפי הקוד ב-referral_codes
+        code_row = conn.execute(
+            "SELECT user_id FROM referral_codes WHERE code = ?", (code,)
+        ).fetchone()
+        if not code_row:
+            return False
+        referrer_id = code_row["user_id"]
+
+        # לא מאפשרים הפניה עצמית
+        if referrer_id == referred_id:
+            return False
+
+        # UNIQUE(referred_id) מבטיח ברמת ה-DB שכל משתמש מופנה רק פעם אחת.
+        # INSERT OR IGNORE מחזיר rowcount=0 אם referred_id כבר קיים.
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO referrals (referrer_id, referred_id, code) VALUES (?, ?, ?)",
+            (referrer_id, referred_id, code),
+        )
+        return cursor.rowcount > 0
+
+
+def complete_referral(referred_id: str) -> bool:
+    """הפעלת ההפניה — נקרא לאחר שהלקוח המופנה השלים תור ראשון.
+
+    יוצר זיכויים (credits) לשני הצדדים. מחזיר True אם הופעל בהצלחה.
+    """
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM referrals WHERE referred_id = ? AND status = 'pending'",
+            (referred_id,),
+        ).fetchone()
+        if not row:
+            return False
+
+        now = datetime.now(timezone.utc)
+        # תוקף הזיכוי — חודשיים מרגע ההפעלה (UTC כמו datetime('now') של SQLite)
+        expires_at = (now + timedelta(days=60)).strftime("%Y-%m-%d %H:%M:%S")
+
+        # סימון אטומי — AND status = 'pending' מונע כפילות בקריאות מקבילות
+        cursor = conn.execute(
+            "UPDATE referrals SET status = 'completed', completed_at = datetime('now') "
+            "WHERE id = ? AND status = 'pending'",
+            (row["id"],),
+        )
+        if cursor.rowcount == 0:
+            return False
+
+        # זיכוי למפנה — 10% הנחה
+        conn.execute(
+            "INSERT INTO credits (user_id, amount, type, reason, expires_at) VALUES (?, ?, ?, ?, ?)",
+            (row["referrer_id"], 10.0, "referrer", f"הפניית לקוח חדש (קוד: {row['code']})", expires_at),
+        )
+
+        # זיכוי למופנה — 10% הנחה
+        conn.execute(
+            "INSERT INTO credits (user_id, amount, type, reason, expires_at) VALUES (?, ?, ?, ?, ?)",
+            (referred_id, 10.0, "referred", f"הצטרפות דרך הפניה (קוד: {row['code']})", expires_at),
+        )
+
+        return True
+
+
+def get_user_referral_code(user_id: str) -> Optional[str]:
+    """החזרת קוד ההפניה של משתמש (אם קיים)."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT code FROM referral_codes WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        return row["code"] if row else None
+
+
+def is_referral_code_sent(user_id: str) -> bool:
+    """בדיקה האם קוד ההפניה כבר נשלח למשתמש."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT sent FROM referral_codes WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        return bool(row and row["sent"])
+
+
+def mark_referral_code_as_sent(user_id: str) -> bool:
+    """סימון אטומי שקוד ההפניה נשלח. מחזיר True רק אם הצליח לתפוס את הנעילה.
+
+    משמש למניעת race condition — רק תהליך אחד (בוט או אדמין) מצליח לסמן
+    sent=1 כש-sent=0, ורק הוא שולח את ההודעה.
+    אם השליחה נכשלת — יש לקרוא ל-unmark_referral_code_sent כדי לאפשר ניסיון חוזר.
+    """
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "UPDATE referral_codes SET sent = 1 WHERE user_id = ? AND sent = 0",
+            (user_id,),
+        )
+        return cursor.rowcount > 0
+
+
+def unmark_referral_code_sent(user_id: str):
+    """ביטול דגל השליחה — נקרא כשמשלוח ההודעה נכשל, כדי לאפשר ניסיון חוזר."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE referral_codes SET sent = 0 WHERE user_id = ?",
+            (user_id,),
+        )
+
+
+def get_active_credits(user_id: str) -> list[dict]:
+    """החזרת זיכויים פעילים (לא נוצלו ולא פגו) של משתמש."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT * FROM credits
+               WHERE user_id = ? AND used = 0 AND expires_at > datetime('now')
+               ORDER BY expires_at ASC""",
+            (user_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def use_credit(credit_id: int):
+    """סימון זיכוי כמנוצל."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE credits SET used = 1 WHERE id = ?",
+            (credit_id,),
+        )
+
+
+def count_referrals(user_id: str, status: str | None = None) -> int:
+    """ספירת הפניות של משתמש מפנה."""
+    with get_connection() as conn:
+        if status:
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM referrals WHERE referrer_id = ? AND status = ?",
+                (user_id, status),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM referrals WHERE referrer_id = ?",
+                (user_id,),
+            ).fetchone()
+        return int(row["count"]) if row else 0
+
+
+def get_referral_stats() -> dict:
+    """סטטיסטיקות הפניות לדשבורד האדמין."""
+    with get_connection() as conn:
+        total = conn.execute(
+            "SELECT COUNT(*) AS c FROM referrals"
+        ).fetchone()["c"]
+        completed = conn.execute(
+            "SELECT COUNT(*) AS c FROM referrals WHERE status = 'completed'"
+        ).fetchone()["c"]
+        pending = conn.execute(
+            "SELECT COUNT(*) AS c FROM referrals WHERE status = 'pending'"
+        ).fetchone()["c"]
+        active_credits = conn.execute(
+            "SELECT COUNT(*) AS c FROM credits WHERE used = 0 AND expires_at > datetime('now')"
+        ).fetchone()["c"]
+        return {
+            "total_referrals": total,
+            "completed_referrals": completed,
+            "pending_referrals": pending,
+            "active_credits": active_credits,
+        }
+
+
+def get_top_referrers(limit: int = 10) -> list[dict]:
+    """החזרת מפנים מובילים (לפי כמות הפניות שהושלמו)."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT r.referrer_id,
+                      COUNT(*) AS total_referrals,
+                      SUM(CASE WHEN r.status = 'completed' THEN 1 ELSE 0 END) AS completed_referrals
+               FROM referrals r
+               GROUP BY r.referrer_id
+               ORDER BY completed_referrals DESC, total_referrals DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_all_referrals(limit: int | None = None) -> list[dict]:
+    """החזרת כל ההפניות לפאנל האדמין."""
+    with get_connection() as conn:
+        query = """SELECT r.*,
+                          c_referrer.username AS referrer_name,
+                          c_referred.username AS referred_name
+                   FROM referrals r
+                   LEFT JOIN (SELECT user_id, username FROM conversations WHERE username != ''
+                              GROUP BY user_id) c_referrer ON r.referrer_id = c_referrer.user_id
+                   LEFT JOIN (SELECT user_id, username FROM conversations WHERE username != ''
+                              GROUP BY user_id) c_referred ON r.referred_id = c_referred.user_id
+                   ORDER BY r.created_at DESC"""
+        params: list[object] = []
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+def has_pending_referral(user_id: str) -> bool:
+    """בדיקה האם למשתמש יש הפניה ממתינה (נרשם דרך קוד אבל עוד לא השלים תור)."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM referrals WHERE referred_id = ? AND status = 'pending'",
+            (user_id,),
+        ).fetchone()
+        return row is not None
+
+
+def has_completed_appointment(user_id: str) -> bool:
+    """בדיקה האם למשתמש יש לפחות תור אחד שהושלם (confirmed)."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM appointments WHERE user_id = ? AND status = 'confirmed'",
+            (user_id,),
+        ).fetchone()
+        return row is not None
+
+
+# ─── Broadcast (הודעות יזומות) ─────────────────────────────────────────────
+
+def create_broadcast(message_text: str, audience: str, total_recipients: int) -> int:
+    """יצירת הודעת שידור חדשה. מחזיר את ה-ID."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO broadcast_messages (message_text, audience, total_recipients) "
+            "VALUES (?, ?, ?)",
+            (message_text, audience, total_recipients),
+        )
+        return cursor.lastrowid
+
+
+def get_all_broadcasts(limit: int = 50) -> list[dict]:
+    """קבלת כל הודעות השידור, מהחדשה לישנה."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM broadcast_messages ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def update_broadcast_progress(broadcast_id: int, sent_count: int, failed_count: int):
+    """עדכון התקדמות שליחת שידור."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE broadcast_messages SET sent_count = ?, failed_count = ?, "
+            "status = 'sending' WHERE id = ?",
+            (sent_count, failed_count, broadcast_id),
+        )
+
+
+def complete_broadcast(broadcast_id: int, sent_count: int, failed_count: int):
+    """סיום שידור — סימון כהושלם עם הסטטיסטיקות הסופיות."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE broadcast_messages SET sent_count = ?, failed_count = ?, "
+            "status = 'completed', completed_at = datetime('now') WHERE id = ?",
+            (sent_count, failed_count, broadcast_id),
+        )
+
+
+def fail_broadcast(broadcast_id: int, sent_count: int | None = None, failed_count: int | None = None):
+    """סימון שידור ככישלון.
+
+    אם sent_count/failed_count הם None — שומר על הערכים שכבר ב-DB
+    (שנכתבו ע"י update_broadcast_progress במהלך השליחה).
+    """
+    with get_connection() as conn:
+        if sent_count is not None and failed_count is not None:
+            conn.execute(
+                "UPDATE broadcast_messages SET sent_count = ?, failed_count = ?, "
+                "status = 'failed', completed_at = datetime('now') WHERE id = ?",
+                (sent_count, failed_count, broadcast_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE broadcast_messages SET status = 'failed', "
+                "completed_at = datetime('now') WHERE id = ?",
+                (broadcast_id,),
+            )
+
+
+def mark_broadcast_sending(broadcast_id: int):
+    """סימון שידור כ-sending — נקרא בתחילת השליחה בפועל."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE broadcast_messages SET status = 'sending' WHERE id = ? AND status = 'queued'",
+            (broadcast_id,),
+        )
+
+
+# ─── User Subscriptions (הרשמה/ביטול הרשמה) ───────────────────────────────
+
+def ensure_user_subscribed(user_id: str):
+    """רישום משתמש כמנוי (נקרא בכל אינטראקציה ראשונה).
+
+    אם המשתמש כבר קיים — לא משנה את הסטטוס שלו (אולי ביטל הרשמה).
+    """
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO user_subscriptions (user_id) VALUES (?)",
+            (user_id,),
+        )
+
+
+def unsubscribe_user(user_id: str):
+    """ביטול הרשמת משתמש לשידורים."""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO user_subscriptions (user_id, is_subscribed, updated_at) "
+            "VALUES (?, 0, datetime('now')) "
+            "ON CONFLICT(user_id) DO UPDATE SET is_subscribed = 0, updated_at = datetime('now')",
+            (user_id,),
+        )
+
+
+def resubscribe_user(user_id: str):
+    """החזרת הרשמת משתמש לשידורים."""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO user_subscriptions (user_id, is_subscribed, updated_at) "
+            "VALUES (?, 1, datetime('now')) "
+            "ON CONFLICT(user_id) DO UPDATE SET is_subscribed = 1, updated_at = datetime('now')",
+            (user_id,),
+        )
+
+
+def is_user_subscribed(user_id: str) -> bool:
+    """בדיקה האם משתמש רשום לקבלת שידורים (ברירת מחדל: כן)."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT is_subscribed FROM user_subscriptions WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        # אם לא קיים — ברירת מחדל רשום
+        return bool(row["is_subscribed"]) if row else True
+
+
+def _broadcast_audience_sql(audience: str) -> tuple[str, str]:
+    """בניית חלקי ה-SQL המשותפים לפי סוג קהל.
+
+    מחזיר (join_clause, where_clause) — משותפים ל-get ול-count.
+    """
+    base_join = "LEFT JOIN user_subscriptions us ON c.user_id = us.user_id"
+    base_where = "COALESCE(us.is_subscribed, 1) = 1"
+
+    if audience == "booked":
+        join = base_join
+        where = f"EXISTS (SELECT 1 FROM appointments a WHERE a.user_id = c.user_id)\n                  AND {base_where}"
+    elif audience == "recent":
+        join = base_join
+        where = f"c.created_at >= datetime('now', '-30 days')\n                  AND {base_where}"
+    else:  # all
+        join = base_join
+        where = base_where
+
+    return join, where
+
+
+def get_broadcast_recipients(audience: str) -> list[str]:
+    """קבלת רשימת user_ids לשידור לפי סוג קהל.
+
+    - all: כל המשתמשים שדיברו עם הבוט (פרט למי שביטל הרשמה)
+    - booked: רק מי שקבע תור (אי פעם)
+    - recent: רק מי שהיה פעיל ב-30 הימים האחרונים
+    """
+    join, where = _broadcast_audience_sql(audience)
+    with get_connection() as conn:
+        rows = conn.execute(f"""
+            SELECT DISTINCT c.user_id
+            FROM conversations c
+            {join}
+            WHERE {where}
+        """).fetchall()
+        return [r["user_id"] for r in rows]
+
+
+def count_broadcast_recipients(audience: str) -> int:
+    """ספירת נמענים פוטנציאליים לשידור (ללא שליחה בפועל).
+
+    משתמש ב-COUNT ברמת ה-SQL במקום לטעון את כל הרשומות לזיכרון.
+    """
+    join, where = _broadcast_audience_sql(audience)
+    with get_connection() as conn:
+        row = conn.execute(f"""
+            SELECT COUNT(DISTINCT c.user_id) AS cnt
+            FROM conversations c
+            {join}
+            WHERE {where}
+        """).fetchone()
+        return int(row["cnt"]) if row else 0
+
+
+# ─── Engagement Queries ──────────────────────────────────────────────────────
+
+def check_high_engagement(user_id: str) -> bool:
+    """בדיקת מעורבות גבוהה — האם למשתמש יש 10+ הודעות ב-30 דקות או 20+ ביום.
+
+    שאילתה אחת עם SUM(CASE WHEN ...) למניעת שני סריקות נפרדות.
+    """
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                SUM(CASE WHEN created_at >= datetime('now', '-30 minutes') THEN 1 ELSE 0 END) AS cnt_30m,
+                SUM(CASE WHEN created_at >= datetime('now', '-1 day') THEN 1 ELSE 0 END) AS cnt_1d
+            FROM conversations
+            WHERE user_id = ? AND role = 'user'
+              AND created_at >= datetime('now', '-1 day')
+            """,
+            (user_id,),
+        ).fetchone()
+        if not row:
+            return False
+        return (int(row["cnt_30m"] or 0) >= 10) or (int(row["cnt_1d"] or 0) >= 20)
+
+
+# ─── Analytics ──────────────────────────────────────────────────────────────
+
+
+def get_analytics_summary(days: int = 30) -> dict:
+    """נתוני סיכום אנליטיים לתקופה נתונה — שאילתה מאוחדת אחת."""
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                COUNT(CASE WHEN role = 'user' THEN 1 END) AS total_user_messages,
+                COUNT(CASE WHEN role = 'assistant' THEN 1 END) AS total_bot_messages,
+                COUNT(DISTINCT CASE WHEN role = 'user' THEN user_id END) AS unique_users
+            FROM conversations
+            WHERE created_at >= datetime('now', ?)
+            """,
+            (f"-{days} days",),
+        ).fetchone()
+        summary = dict(row) if row else {
+            "total_user_messages": 0, "total_bot_messages": 0, "unique_users": 0,
+        }
+
+        # פערי ידע ובקשות נציג בתקופה
+        counts_row = conn.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM unanswered_questions
+                 WHERE created_at >= datetime('now', ?)) AS unanswered_count,
+                (SELECT COUNT(*) FROM agent_requests
+                 WHERE created_at >= datetime('now', ?)) AS agent_request_count
+            """,
+            (f"-{days} days", f"-{days} days"),
+        ).fetchone()
+        summary.update(dict(counts_row) if counts_row else {})
+
+        # אחוז fallback — הודעות משתמש שגרמו ל-unanswered
+        total_user = summary.get("total_user_messages", 0)
+        unanswered = summary.get("unanswered_count", 0)
+        summary["fallback_rate"] = round(
+            (unanswered / total_user * 100) if total_user > 0 else 0, 1
+        )
+        return summary
+
+
+def get_daily_message_counts(days: int = 30) -> list[dict]:
+    """מספר הודעות לפי יום בשעון ישראל — לגרף טרנד.
+
+    SQLite שומר UTC. ההמרה לשעון ישראל (כולל שעון קיץ) נעשית ב-Python
+    כדי שגבולות הימים ישקפו את הפעילות האמיתית של הלקוחות.
+    """
+    from zoneinfo import ZoneInfo
+
+    israel_tz = ZoneInfo("Asia/Jerusalem")
+
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT created_at, user_id
+            FROM conversations
+            WHERE role = 'user'
+              AND created_at >= datetime('now', ?)
+            """,
+            (f"-{days} days",),
+        ).fetchall()
+
+        # קיבוץ לפי יום בשעון ישראל
+        day_data: dict[str, dict] = {}
+        for r in rows:
+            try:
+                utc_dt = datetime.strptime(r["created_at"], "%Y-%m-%d %H:%M:%S")
+                utc_dt = utc_dt.replace(tzinfo=timezone.utc)
+                local_day = utc_dt.astimezone(israel_tz).strftime("%Y-%m-%d")
+            except (ValueError, TypeError):
+                logger.error("שגיאה בפירוש תאריך בספירה יומית: %s",
+                             r["created_at"])
+                continue
+
+            if local_day not in day_data:
+                day_data[local_day] = {"user_messages": 0, "user_ids": set()}
+            entry = day_data[local_day]
+            entry["user_messages"] += 1
+            entry["user_ids"].add(r["user_id"])
+
+        return [
+            {
+                "day": day,
+                "user_messages": d["user_messages"],
+                "unique_users": len(d["user_ids"]),
+            }
+            for day, d in sorted(day_data.items())
+        ]
+
+
+def get_hourly_distribution(days: int = 30) -> list[dict]:
+    """התפלגות הודעות לפי שעה ביום בשעון ישראל — לזיהוי שעות עומס.
+
+    SQLite שומר UTC. ההמרה לשעון ישראל (כולל שעון קיץ) נעשית ב-Python
+    כדי לשקף את השעות האמיתיות שבהן הלקוחות פעילים.
+    """
+    from zoneinfo import ZoneInfo
+
+    israel_tz = ZoneInfo("Asia/Jerusalem")
+
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT created_at
+            FROM conversations
+            WHERE role = 'user'
+              AND created_at >= datetime('now', ?)
+            """,
+            (f"-{days} days",),
+        ).fetchall()
+        # המרת כל timestamp לשעה מקומית וספירה
+        hour_counts: dict[int, int] = {}
+        for r in rows:
+            try:
+                utc_dt = datetime.strptime(r["created_at"], "%Y-%m-%d %H:%M:%S")
+                utc_dt = utc_dt.replace(tzinfo=timezone.utc)
+                local_hour = utc_dt.astimezone(israel_tz).hour
+                hour_counts[local_hour] = hour_counts.get(local_hour, 0) + 1
+            except (ValueError, TypeError):
+                logger.error("שגיאה בפירוש תאריך בהתפלגות שעתית: %s", r["created_at"])
+        return [{"hour": h, "message_count": hour_counts.get(h, 0)} for h in range(24)]
+
+
+def get_top_unanswered_questions(days: int = 30, limit: int = 10) -> list[dict]:
+    """שאלות שחוזרות על עצמן בפערי ידע — לזיהוי נושאים חמים."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT question, COUNT(*) AS ask_count,
+                   MAX(created_at) AS last_asked,
+                   MIN(status) AS status
+            FROM unanswered_questions
+            WHERE created_at >= datetime('now', ?)
+            GROUP BY question
+            ORDER BY ask_count DESC, last_asked DESC
+            LIMIT ?
+            """,
+            (f"-{days} days", limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_user_engagement_stats(days: int = 30) -> dict:
+    """סטטיסטיקות מעורבות משתמשים — ממוצע הודעות, שיחות קצרות וחוזרים."""
+    with get_connection() as conn:
+        # ממוצע הודעות למשתמש
+        row = conn.execute(
+            """
+            SELECT
+                AVG(msg_count) AS avg_messages_per_user,
+                COUNT(*) AS total_users,
+                COUNT(CASE WHEN msg_count = 1 THEN 1 END) AS single_message_users,
+                COUNT(CASE WHEN msg_count >= 5 THEN 1 END) AS engaged_users
+            FROM (
+                SELECT user_id, COUNT(*) AS msg_count
+                FROM conversations
+                WHERE role = 'user'
+                  AND created_at >= datetime('now', ?)
+                GROUP BY user_id
+            )
+            """,
+            (f"-{days} days",),
+        ).fetchone()
+        stats = dict(row) if row else {}
+        stats["avg_messages_per_user"] = round(
+            float(stats.get("avg_messages_per_user") or 0), 1
+        )
+
+        # משתמשים חוזרים — מישהו שהיה פעיל גם לפני התקופה הנוכחית
+        returning = conn.execute(
+            """
+            SELECT COUNT(DISTINCT c1.user_id) AS returning_users
+            FROM conversations c1
+            WHERE c1.role = 'user'
+              AND c1.created_at >= datetime('now', ?)
+              AND EXISTS (
+                  SELECT 1 FROM conversations c2
+                  WHERE c2.user_id = c1.user_id
+                    AND c2.role = 'user'
+                    AND c2.created_at < datetime('now', ?)
+              )
+            """,
+            (f"-{days} days", f"-{days} days"),
+        ).fetchone()
+        stats["returning_users"] = returning["returning_users"] if returning else 0
+
+        return stats
+
+
+def get_conversations_with_drop_off(days: int = 30, limit: int = 10) -> list[dict]:
+    """שיחות שבהן המשתמש שלח הודעה אחת בלבד ונטש — לאבחון drop-off.
+
+    מחזיר את ההודעה האחרונה של כל משתמש עם הודעה יחידה, כדי לאפשר drill-down.
+    """
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT c.user_id, c.username, c.message, c.created_at
+            FROM conversations c
+            INNER JOIN (
+                SELECT user_id
+                FROM conversations
+                WHERE role = 'user'
+                  AND created_at >= datetime('now', ?)
+                GROUP BY user_id
+                HAVING COUNT(*) = 1
+            ) single ON c.user_id = single.user_id
+            WHERE c.role = 'user'
+              AND c.created_at >= datetime('now', ?)
+            ORDER BY c.created_at DESC
+            LIMIT ?
+            """,
+            (f"-{days} days", f"-{days} days", limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_popular_kb_sources(days: int = 30, limit: int = 10) -> list[dict]:
+    """מקורות ידע שצוטטו הכי הרבה — לזיהוי תכנים פופולריים."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT sources, COUNT(*) AS cite_count
+            FROM conversations
+            WHERE role = 'assistant'
+              AND sources IS NOT NULL AND sources != ''
+              AND created_at >= datetime('now', ?)
+            GROUP BY sources
+            ORDER BY cite_count DESC
+            LIMIT ?
+            """,
+            (f"-{days} days", limit),
+        ).fetchall()
+        return [dict(r) for r in rows]

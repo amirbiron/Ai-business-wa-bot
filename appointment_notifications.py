@@ -1,7 +1,7 @@
 """
 appointment_notifications — התראות סטטוס אוטומטיות לתורים.
 
-שולח הודעת טלגרם ללקוח כשבעל העסק משנה סטטוס תור
+שולח הודעה ללקוח (טלגרם או וואטסאפ) כשבעל העסק משנה סטטוס תור
 (pending → confirmed / cancelled) דרך פאנל הניהול.
 
 ראה: https://github.com/amirbiron/ai-business-bot/issues/80
@@ -20,6 +20,7 @@ def _build_confirmed_message(
     date: str,
     time: str,
     owner_message: str = "",
+    **kwargs,
 ) -> str:
     """בניית הודעת אישור תור."""
     lines = [
@@ -40,6 +41,8 @@ def _build_cancelled_message(
     date: str,
     time: str,
     owner_message: str = "",
+    is_whatsapp: bool = False,
+    **kwargs,
 ) -> str:
     """בניית הודעת ביטול תור."""
     lines = [
@@ -51,7 +54,11 @@ def _build_cancelled_message(
     ]
     if owner_message:
         lines += ["", f"💬 {owner_message}"]
-    lines += ["", "לקביעת תור חדש, שלחו /book"]
+    # הוראה לקביעת תור חדש — מותאמת לפלטפורמה
+    if is_whatsapp:
+        lines += ["", "לקביעת תור חדש, כתבו לנו *תור* 📅"]
+    else:
+        lines += ["", "לקביעת תור חדש, שלחו /book"]
     return "\n".join(lines)
 
 
@@ -95,11 +102,13 @@ def notify_appointment_status(appt: dict, owner_message: str = "") -> bool:
         )
         return False
 
+    is_wa = str(user_id).startswith("wa_")
     text = builder(
         service=appt.get("service", ""),
         date=appt.get("preferred_date", ""),
         time=appt.get("preferred_time", ""),
         owner_message=owner_message.strip(),
+        is_whatsapp=is_wa,
     )
 
     success = send_message_to_user(user_id, text)

@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="page-header animate-fade-in">
+    <h1><i class="bi bi-bell"></i> בקשות נציג</h1>
+</div>
+
+<div class="card animate-slide-up">
+    <div class="card-body" style="padding: 0;">
+        {% if requests %}
+        <div class="table-wrapper">
+            <table>
+                <thead>
+                    <tr>
+                        <th>מזהה</th>
+                        <th>לקוח</th>
+                        <th>הודעה</th>
+                        <th>סטטוס</th>
+                        <th>נוצר</th>
+                        <th>פעולות</th>
+                    </tr>
+                </thead>
+                <tbody id="requests-table-body">
+                    {% for req in requests %}
+                    {% include "partials/request_row.html" %}
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="empty-state">
+            <i class="bi bi-check-circle"></i>
+            <p>אין עדיין בקשות נציג.</p>
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

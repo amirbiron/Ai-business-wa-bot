@@ -313,8 +313,8 @@ def handle_whatsapp_button_reply(
     elif button_id == "cancel_appt_no":
         _handle_cancel_confirm(phone, user_id, display_name, confirmed=False)
 
-    elif button_id.startswith("booking_service_"):
-        # בחירת שירות מרשימה בזמן booking
+    elif button_id.startswith("booking_service_") or button_id.startswith("booking_confirm_"):
+        # כפתורי booking — בחירת שירות או אישור/ביטול
         _handle_booking_button(phone, user_id, display_name, button_id, button_title)
 
     else:

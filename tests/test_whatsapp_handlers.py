@@ -171,3 +171,41 @@ class TestHandleButtonReply:
             wh.handle_whatsapp_button_reply("972501234567", "btn_agent", "👤 נציג", "Test")
 
             mock_agent.assert_called_once()
+
+    def test_booking_confirm_yes_routes_to_handler(self):
+        """כפתור booking_confirm_yes מגיע ל-_handle_booking_button ולא נופל ל-else."""
+        import bot.whatsapp_handlers as wh
+
+        with (
+            patch.object(wh, "send_text_message"),
+            patch.object(wh, "send_buttons_message"),
+            patch.object(wh, "db"),
+            patch.object(wh, "LiveChatService") as mock_lcs,
+            patch.object(wh, "_handle_booking_button") as mock_booking_btn,
+            patch.object(wh, "check_rate_limit", return_value=None),
+            patch.object(wh, "record_message"),
+        ):
+            mock_lcs.is_active.return_value = False
+
+            wh.handle_whatsapp_button_reply("972501234567", "booking_confirm_yes", "✅ אישור", "Test")
+
+            mock_booking_btn.assert_called_once()
+
+    def test_booking_confirm_no_routes_to_handler(self):
+        """כפתור booking_confirm_no מגיע ל-_handle_booking_button ולא נופל ל-else."""
+        import bot.whatsapp_handlers as wh
+
+        with (
+            patch.object(wh, "send_text_message"),
+            patch.object(wh, "send_buttons_message"),
+            patch.object(wh, "db"),
+            patch.object(wh, "LiveChatService") as mock_lcs,
+            patch.object(wh, "_handle_booking_button") as mock_booking_btn,
+            patch.object(wh, "check_rate_limit", return_value=None),
+            patch.object(wh, "record_message"),
+        ):
+            mock_lcs.is_active.return_value = False
+
+            wh.handle_whatsapp_button_reply("972501234567", "booking_confirm_no", "❌ ביטול", "Test")
+
+            mock_booking_btn.assert_called_once()

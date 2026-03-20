@@ -68,6 +68,19 @@ class TestWebhookVerification:
         resp = client.get("/webhook/whatsapp")
         assert resp.status_code == 403
 
+    def test_verify_empty_token_rejected(self, client):
+        """אם WHATSAPP_VERIFY_TOKEN ריק — לא מאשרים webhook גם עם token ריק."""
+        with patch.object(ww, "WHATSAPP_VERIFY_TOKEN", ""):
+            resp = client.get(
+                "/webhook/whatsapp",
+                query_string={
+                    "hub.mode": "subscribe",
+                    "hub.verify_token": "",
+                    "hub.challenge": "HACK",
+                },
+            )
+            assert resp.status_code == 403
+
 
 class TestWebhookReceive:
     """בדיקות קבלת הודעות (POST)."""

@@ -23,7 +23,7 @@ def verify_webhook():
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
 
-    if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
+    if mode == "subscribe" and WHATSAPP_VERIFY_TOKEN and token == WHATSAPP_VERIFY_TOKEN:
         logger.info("WhatsApp webhook verified successfully")
         return challenge, 200
 

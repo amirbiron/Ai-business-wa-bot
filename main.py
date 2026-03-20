@@ -17,7 +17,7 @@ import sys
 import sentry_sdk
 
 from ai_chatbot import database as db
-from ai_chatbot.config import TELEGRAM_BOT_TOKEN, ADMIN_HOST, ADMIN_PORT, validate_config
+from ai_chatbot.config import TELEGRAM_BOT_TOKEN, WHATSAPP_ACCESS_TOKEN, ADMIN_HOST, ADMIN_PORT, validate_config
 
 # ─── Sentry — ניטור שגיאות בפרודקשן ──────────────────────────────────────────
 _sentry_dsn = os.getenv("SENTRY_DSN", "")
@@ -115,12 +115,17 @@ def main():
     
     # Default: run both
     logger.info("Starting AI Business Chatbot (Bot + Admin Panel)...")
-    
+
+    # הודעת סטטוס — אילו ערוצים פעילים
+    if WHATSAPP_ACCESS_TOKEN:
+        logger.info("WhatsApp channel enabled — webhook at /webhook/whatsapp")
+
     # Start admin panel in a background thread
+    # (WhatsApp webhook רשום כ-blueprint בתוך admin app — מקבל הודעות דרך אותו שרת)
     admin_thread = threading.Thread(target=run_admin_panel, daemon=True)
     admin_thread.start()
     logger.info("Admin panel started at http://%s:%s", ADMIN_HOST, ADMIN_PORT)
-    
+
     # Start the Telegram bot in the main thread (it uses asyncio)
     if TELEGRAM_BOT_TOKEN:
         run_telegram_bot()

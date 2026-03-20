@@ -18,6 +18,8 @@ from telegram import Bot
 from telegram.error import Forbidden, RetryAfter, TimedOut, BadRequest
 
 from ai_chatbot import database as db
+from ai_chatbot.bot.whatsapp_api import send_template_message as send_wa_template
+from ai_chatbot.config import WHATSAPP_BROADCAST_TEMPLATE
 
 logger = logging.getLogger(__name__)
 
@@ -75,8 +77,30 @@ async def send_broadcast(
 
         for i, user_id in enumerate(recipients):
             try:
-                await bot.send_message(chat_id=int(user_id), text=message_text)
-                sent += 1
+                if user_id.startswith("wa_"):
+                    # משתמש וואטסאפ — שליחה דרך Message Template (חובה לפי Meta)
+                    if not WHATSAPP_BROADCAST_TEMPLATE:
+                        logger.error(
+                            "Broadcast %d: WHATSAPP_BROADCAST_TEMPLATE not configured, "
+                            "skipping WhatsApp user %s", broadcast_id, user_id,
+                        )
+                        failed += 1
+                        continue
+                    phone = user_id[3:]
+                    # העברת טקסט ההודעה כפרמטר body ל-template
+                    components = [{"type": "body", "parameters": [{"type": "text", "text": message_text}]}]
+                    wa_success = await asyncio.to_thread(
+                        send_wa_template, phone, WHATSAPP_BROADCAST_TEMPLATE, "he", components,
+                    )
+                    if wa_success:
+                        sent += 1
+                    else:
+                        logger.error("Broadcast %d: WhatsApp template send failed for %s", broadcast_id, user_id)
+                        failed += 1
+                else:
+                    # משתמש טלגרם — שליחה דרך Telegram Bot
+                    await bot.send_message(chat_id=int(user_id), text=message_text)
+                    sent += 1
             except Forbidden:
                 # המשתמש חסם את הבוט — מסמנים כלא-מנוי
                 logger.info("Broadcast %d: user %s blocked the bot, unsubscribing", broadcast_id, user_id)
@@ -90,7 +114,6 @@ async def send_broadcast(
                     await bot.send_message(chat_id=int(user_id), text=message_text)
                     sent += 1
                 except Forbidden:
-                    # המשתמש חסם את הבוט גם בניסיון החוזר — מסמנים כלא-מנוי
                     logger.info("Broadcast %d: user %s blocked the bot on retry, unsubscribing", broadcast_id, user_id)
                     _safe_unsubscribe(broadcast_id, user_id)
                     failed += 1

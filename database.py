@@ -605,13 +605,14 @@ def create_agent_request(
     username: str,
     message: str = "",
     telegram_username: str = "",
+    platform: str = "telegram",
 ) -> int:
     """Create a new agent transfer request."""
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO agent_requests (user_id, username, telegram_username, message) VALUES (?, ?, ?, ?)",
-            (user_id, username, telegram_username or "", message)
+            "INSERT INTO agent_requests (user_id, username, telegram_username, message, platform) VALUES (?, ?, ?, ?, ?)",
+            (user_id, username, telegram_username or "", message, platform)
         )
         return cursor.lastrowid
 
@@ -693,14 +694,15 @@ def create_appointment(
     preferred_time: str = "",
     notes: str = "",
     telegram_username: str = "",
+    platform: str = "telegram",
 ) -> int:
     """Create a new appointment booking."""
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            """INSERT INTO appointments (user_id, username, telegram_username, service, preferred_date, preferred_time, notes)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (user_id, username, telegram_username or "", service, preferred_date, preferred_time, notes)
+            """INSERT INTO appointments (user_id, username, telegram_username, service, preferred_date, preferred_time, notes, platform)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, username, telegram_username or "", service, preferred_date, preferred_time, notes, platform)
         )
         return cursor.lastrowid
 
@@ -1782,3 +1784,32 @@ def get_popular_kb_sources(days: int = 30, limit: int = 10) -> list[dict]:
             (f"-{days} days", limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+# ── WhatsApp Booking State Machine ──────────────────────────────────────────
+
+
+def get_wa_booking_state(user_id: str) -> dict | None:
+    """קריאת מצב booking נוכחי למשתמש וואטסאפ."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT user_id, state, data_json, updated_at FROM wa_booking_state WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def set_wa_booking_state(user_id: str, state: str, data_json: str = "{}") -> None:
+    """עדכון או יצירת מצב booking למשתמש וואטסאפ."""
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO wa_booking_state (user_id, state, data_json, updated_at)
+               VALUES (?, ?, ?, datetime('now'))""",
+            (user_id, state, data_json),
+        )
+
+
+def clear_wa_booking_state(user_id: str) -> None:
+    """מחיקת מצב booking למשתמש וואטסאפ."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM wa_booking_state WHERE user_id = ?", (user_id,))

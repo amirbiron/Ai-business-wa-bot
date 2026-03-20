@@ -63,6 +63,30 @@ if "telegram" not in sys.modules:
     sys.modules["telegram.ext"] = _ext
     _telegram.ext = _ext
 
+# ── Mock numpy/faiss/openai (לא מותקנים בסביבת הטסטים) ─────────────────────
+if "numpy" not in sys.modules:
+    _np = types.ModuleType("numpy")
+    _np.ndarray = type("ndarray", (), {})
+    _np.array = MagicMock()
+    _np.zeros = MagicMock()
+    _np.frombuffer = MagicMock()
+    _np.float32 = float
+    sys.modules["numpy"] = _np
+
+    _np_linalg = types.ModuleType("numpy.linalg")
+    _np_linalg.norm = MagicMock(return_value=1.0)
+    sys.modules["numpy.linalg"] = _np_linalg
+    _np.linalg = _np_linalg
+
+if "faiss" not in sys.modules:
+    sys.modules["faiss"] = MagicMock()
+
+if "openai" not in sys.modules:
+    sys.modules["openai"] = MagicMock()
+
+if "holidays" not in sys.modules:
+    sys.modules["holidays"] = MagicMock()
+
 # ── Mock requests (לא צריך HTTP אמיתי בטסטים) ─────────────────────────────
 if "requests" not in sys.modules:
     sys.modules["requests"] = types.ModuleType("requests")

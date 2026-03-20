@@ -54,7 +54,7 @@ class TestStart:
         with patch("live_chat_service.send_telegram_message", return_value=False):
             from live_chat_service import LiveChatService
             sent, status = LiveChatService.start("123")
-            assert status == "telegram_failed"
+            assert status == "send_failed"
             assert sent is False
             # השיחה עדיין נפתחה ב-DB
             assert db.is_live_chat_active("123")
@@ -93,7 +93,7 @@ class TestEnd:
             from live_chat_service import LiveChatService
             db.start_live_chat("123", "אבי")
             sent, status = LiveChatService.end("123")
-            assert status == "telegram_failed"
+            assert status == "send_failed"
             # השיחה עדיין נסגרת ב-DB (חשוב!)
             assert not db.is_live_chat_active("123")
 
@@ -135,7 +135,7 @@ class TestSend:
             from live_chat_service import LiveChatService
             db.start_live_chat("123", "אבי")
             ok, status = LiveChatService.send("123", "שלום")
-            assert status == "telegram_failed"
+            assert status == "send_failed"
 
     def test_send_touches_session(self, service, db):
         """שליחת הודעה מנציג מעדכנת את updated_at."""

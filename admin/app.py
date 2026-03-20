@@ -1255,6 +1255,16 @@ def create_admin_app() -> Flask:
             "live_chat_updates": live_chat_updates,
         })
 
+    # ─── דפי מדיניות פרטיות ותנאי שימוש (ציבוריים, נדרשים ע"י Meta) ────
+
+    @app.route("/privacy")
+    def privacy():
+        return render_template("privacy.html")
+
+    @app.route("/terms")
+    def terms():
+        return render_template("terms.html")
+
     return app
 
 

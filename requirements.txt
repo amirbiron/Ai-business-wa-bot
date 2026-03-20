@@ -1,0 +1,30 @@
+# ─── Core Libraries ───────────────────────────────────────────────────────────
+
+# Telegram Bot
+python-telegram-bot[ext]
+
+# LLM & Embeddings
+openai
+tiktoken
+
+# Vector Store
+faiss-cpu
+numpy
+
+# Web Admin Panel
+flask
+flask-wtf
+gunicorn
+requests
+
+# Business Hours & Holidays
+holidays
+
+# QR Code Generation
+segno
+
+# Error Tracking
+sentry-sdk[flask]
+
+# Configuration
+python-dotenv

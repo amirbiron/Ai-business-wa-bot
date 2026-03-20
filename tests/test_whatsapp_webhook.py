@@ -1,0 +1,172 @@
+"""
+טסטים ל-WhatsApp webhook endpoint — אימות ופירוק payload.
+"""
+
+import json
+from unittest.mock import patch, MagicMock, ANY
+import pytest
+
+# ייבוא המודול ברמת הקובץ — מאפשר ל-patch למצוא אותו
+import bot.whatsapp_webhook as ww
+
+
+@pytest.fixture(autouse=True)
+def _mock_wa_config(monkeypatch):
+    """הגדרת credentials מדומים."""
+    monkeypatch.setenv("WHATSAPP_PHONE_NUMBER_ID", "123456")
+    monkeypatch.setenv("WHATSAPP_ACCESS_TOKEN", "fake-wa-token")
+    monkeypatch.setenv("WHATSAPP_VERIFY_TOKEN", "test-verify-token")
+
+
+@pytest.fixture
+def app():
+    """יצירת Flask app עם WhatsApp webhook blueprint."""
+    from flask import Flask
+    app = Flask(__name__)
+    app.config["TESTING"] = True
+
+    with patch.object(ww, "WHATSAPP_VERIFY_TOKEN", "test-verify-token"):
+        app.register_blueprint(ww.whatsapp_bp)
+
+    return app
+
+
+@pytest.fixture
+def client(app):
+    return app.test_client()
+
+
+class TestWebhookVerification:
+    """בדיקות אימות Meta webhook (GET)."""
+
+    def test_verify_success(self, client):
+        with patch.object(ww, "WHATSAPP_VERIFY_TOKEN", "test-verify-token"):
+            resp = client.get(
+                "/webhook/whatsapp",
+                query_string={
+                    "hub.mode": "subscribe",
+                    "hub.verify_token": "test-verify-token",
+                    "hub.challenge": "CHALLENGE_STRING",
+                },
+            )
+            assert resp.status_code == 200
+            assert resp.data.decode() == "CHALLENGE_STRING"
+
+    def test_verify_wrong_token(self, client):
+        with patch.object(ww, "WHATSAPP_VERIFY_TOKEN", "test-verify-token"):
+            resp = client.get(
+                "/webhook/whatsapp",
+                query_string={
+                    "hub.mode": "subscribe",
+                    "hub.verify_token": "wrong-token",
+                    "hub.challenge": "CHALLENGE_STRING",
+                },
+            )
+            assert resp.status_code == 403
+
+    def test_verify_missing_params(self, client):
+        resp = client.get("/webhook/whatsapp")
+        assert resp.status_code == 403
+
+
+class TestWebhookReceive:
+    """בדיקות קבלת הודעות (POST)."""
+
+    def test_empty_body_returns_400(self, client):
+        resp = client.post("/webhook/whatsapp")
+        assert resp.status_code == 400
+
+    def test_text_message_dispatched(self, client):
+        with patch.object(ww, "_process_webhook_payload") as mock_process:
+            payload = _build_text_payload("972501234567", "שלום")
+            resp = client.post(
+                "/webhook/whatsapp",
+                data=json.dumps(payload),
+                content_type="application/json",
+            )
+            assert resp.status_code == 200
+            mock_process.assert_called_once()
+
+    def test_processing_error_still_returns_200(self, client):
+        """Meta דורש 200 — גם אם העיבוד נכשל."""
+        with patch.object(ww, "_process_webhook_payload", side_effect=RuntimeError("boom")):
+            payload = _build_text_payload("972501234567", "שלום")
+            resp = client.post(
+                "/webhook/whatsapp",
+                data=json.dumps(payload),
+                content_type="application/json",
+            )
+            assert resp.status_code == 200
+
+    def test_process_text_message(self):
+        """בדיקת פירוק payload עם הודעת טקסט."""
+        # ייבוא המודול כדי שנוכל לעשות patch.object
+        import bot.whatsapp_handlers as wh
+        mock_msg = MagicMock()
+        with patch.object(wh, "handle_whatsapp_message", mock_msg):
+            payload = _build_text_payload("972501234567", "מה שעות הפתיחה?")
+            ww._process_webhook_payload(payload)
+            mock_msg.assert_called_once_with(
+                phone="972501234567",
+                text="מה שעות הפתיחה?",
+                message_id="wamid.test123",
+                display_name="Test User",
+            )
+
+    def test_process_status_ignored(self):
+        """סטטוסי הודעות (delivered/read) מדולגים."""
+        import bot.whatsapp_handlers as wh
+        mock_msg = MagicMock()
+        with patch.object(wh, "handle_whatsapp_message", mock_msg):
+            payload = {
+                "entry": [{
+                    "changes": [{
+                        "value": {
+                            "statuses": [{"id": "wamid.xxx", "status": "delivered"}]
+                        }
+                    }]
+                }]
+            }
+            ww._process_webhook_payload(payload)
+            mock_msg.assert_not_called()
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _build_text_payload(phone: str, text: str) -> dict:
+    return {
+        "entry": [{
+            "changes": [{
+                "value": {
+                    "contacts": [{"profile": {"name": "Test User"}}],
+                    "messages": [{
+                        "from": phone,
+                        "id": "wamid.test123",
+                        "type": "text",
+                        "text": {"body": text},
+                    }],
+                }
+            }]
+        }]
+    }
+
+
+def _build_button_payload(phone: str, button_id: str, title: str) -> dict:
+    return {
+        "entry": [{
+            "changes": [{
+                "value": {
+                    "contacts": [{"profile": {"name": "Test User"}}],
+                    "messages": [{
+                        "from": phone,
+                        "id": "wamid.test456",
+                        "type": "interactive",
+                        "interactive": {
+                            "type": "button_reply",
+                            "button_reply": {"id": button_id, "title": title},
+                        },
+                    }],
+                }
+            }]
+        }]
+    }

@@ -694,8 +694,8 @@ def create_admin_app() -> Flask:
         sent, status = LiveChatService.start(user_id)
         if status == "already_active":
             flash("השיחה החיה כבר פעילה.", "info")
-        elif status == "telegram_failed":
-            flash("השיחה החיה הופעלה, אך ההודעה ללקוח בטלגרם נכשלה.", "warning")
+        elif status in ("telegram_failed", "send_failed"):
+            flash("השיחה החיה הופעלה, אך שליחת ההודעה ללקוח נכשלה.", "warning")
         return redirect(url_for("live_chat", user_id=user_id))
 
     @app.route("/live-chat/<user_id>/end", methods=["POST"])
@@ -706,8 +706,8 @@ def create_admin_app() -> Flask:
         sent, status = LiveChatService.end(user_id)
         if status == "already_ended":
             flash("השיחה החיה כבר הסתיימה.", "info")
-        elif status == "telegram_failed":
-            flash("השיחה הוחזרה לבוט, אך ההודעה ללקוח בטלגרם נכשלה.", "warning")
+        elif status in ("telegram_failed", "send_failed"):
+            flash("השיחה הוחזרה לבוט, אך שליחת ההודעה ללקוח נכשלה.", "warning")
         return redirect(back)
 
     @app.route("/live-chat/<user_id>/send", methods=["POST"])
@@ -722,7 +722,8 @@ def create_admin_app() -> Flask:
             error_messages = {
                 "session_ended": ("השיחה החיה הסתיימה.", "warning", 409),
                 "empty_message": ("לא ניתן לשלוח הודעה ריקה.", "danger", 422),
-                "telegram_failed": ("שליחת ההודעה בטלגרם נכשלה.", "danger", 500),
+                "telegram_failed": ("שליחת ההודעה נכשלה.", "danger", 500),
+                "send_failed": ("שליחת ההודעה נכשלה.", "danger", 500),
             }
             msg, level, code = error_messages.get(status, ("שגיאה לא צפויה.", "danger", 500))
             if request.headers.get("HX-Request"):
@@ -840,9 +841,10 @@ def create_admin_app() -> Flask:
             # שליחת קוד הפניה ללקוח אחרי אישור תור
             # try_send_referral_code — לוגיקה משותפת לבוט ולאדמין:
             # generate → mark → send → unmark on failure
+            from ai_chatbot.live_chat_service import send_message_to_user
             try_send_referral_code(
                 user_id,
-                send_fn=lambda text: send_telegram_message(user_id, text),
+                send_fn=lambda text: send_message_to_user(user_id, text),
             )
 
         if request.headers.get("HX-Request"):
@@ -1264,6 +1266,15 @@ def create_admin_app() -> Flask:
     @app.route("/terms")
     def terms():
         return render_template("terms.html")
+
+    # ── רישום WhatsApp webhook blueprint (אם מוגדר) ──────────────────────
+    from ai_chatbot.config import WHATSAPP_ACCESS_TOKEN
+    if WHATSAPP_ACCESS_TOKEN:
+        from ai_chatbot.bot.whatsapp_webhook import whatsapp_bp
+        # פטור מ-CSRF — Meta שולח POST ללא token
+        csrf.exempt(whatsapp_bp)
+        app.register_blueprint(whatsapp_bp)
+        logger.info("WhatsApp webhook registered at /webhook/whatsapp")
 
     return app
 

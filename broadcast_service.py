@@ -18,6 +18,7 @@ from telegram import Bot
 from telegram.error import Forbidden, RetryAfter, TimedOut, BadRequest
 
 from ai_chatbot import database as db
+from ai_chatbot.bot.whatsapp_api import send_text_message as send_wa_text
 
 logger = logging.getLogger(__name__)
 
@@ -75,8 +76,19 @@ async def send_broadcast(
 
         for i, user_id in enumerate(recipients):
             try:
-                await bot.send_message(chat_id=int(user_id), text=message_text)
-                sent += 1
+                if user_id.startswith("wa_"):
+                    # משתמש וואטסאפ — שליחה דרך WhatsApp API
+                    phone = user_id[3:]
+                    wa_success = await asyncio.to_thread(send_wa_text, phone, message_text)
+                    if wa_success:
+                        sent += 1
+                    else:
+                        logger.error("Broadcast %d: WhatsApp send failed for %s", broadcast_id, user_id)
+                        failed += 1
+                else:
+                    # משתמש טלגרם — שליחה דרך Telegram Bot
+                    await bot.send_message(chat_id=int(user_id), text=message_text)
+                    sent += 1
             except Forbidden:
                 # המשתמש חסם את הבוט — מסמנים כלא-מנוי
                 logger.info("Broadcast %d: user %s blocked the bot, unsubscribing", broadcast_id, user_id)
@@ -90,7 +102,6 @@ async def send_broadcast(
                     await bot.send_message(chat_id=int(user_id), text=message_text)
                     sent += 1
                 except Forbidden:
-                    # המשתמש חסם את הבוט גם בניסיון החוזר — מסמנים כלא-מנוי
                     logger.info("Broadcast %d: user %s blocked the bot on retry, unsubscribing", broadcast_id, user_id)
                     _safe_unsubscribe(broadcast_id, user_id)
                     failed += 1

@@ -182,3 +182,17 @@ def run_migrations(conn) -> None:
                 ON appointments(user_id, preferred_date, preferred_time)
                 WHERE preferred_date != '' AND preferred_time != ''
         """)
+
+    # ─── WhatsApp: עמודת platform ל-agent_requests ו-appointments ─────────
+    _ensure_column(conn, "agent_requests", "platform", "TEXT DEFAULT 'telegram'")
+    _ensure_column(conn, "appointments", "platform", "TEXT DEFAULT 'telegram'")
+
+    # ─── WhatsApp: טבלת booking state machine ─────────────────────────────
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS wa_booking_state (
+            user_id     TEXT PRIMARY KEY,
+            state       TEXT NOT NULL,
+            data_json   TEXT DEFAULT '{}',
+            updated_at  TEXT DEFAULT (datetime('now'))
+        )
+    """)

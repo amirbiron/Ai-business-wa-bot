@@ -29,6 +29,14 @@ FAISS_INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_OWNER_CHAT_ID = os.getenv("TELEGRAM_OWNER_CHAT_ID", "")
 
+# ─── WhatsApp Business Cloud API ─────────────────────────────────────────────
+WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
+WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
+WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
+WHATSAPP_BUSINESS_ACCOUNT_ID = os.getenv("WHATSAPP_BUSINESS_ACCOUNT_ID", "")
+# מספר הטלפון של בעל העסק לקבלת התראות בוואטסאפ (אופציונלי)
+WHATSAPP_OWNER_PHONE = os.getenv("WHATSAPP_OWNER_PHONE", "")
+
 # ─── OpenAI / LLM ───────────────────────────────────────────────────────────
 # ניתן לשנות את המודל דרך משתנה סביבה OPENAI_MODEL (למשל gpt-4o, gpt-4.1)
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
@@ -326,8 +334,8 @@ def validate_config(*, require_bot: bool = False, require_admin: bool = False) -
     """
     errors: list[str] = []
     if require_bot:
-        if not TELEGRAM_BOT_TOKEN:
-            errors.append("TELEGRAM_BOT_TOKEN לא מוגדר — הבוט לא יוכל להתחבר לטלגרם")
+        if not TELEGRAM_BOT_TOKEN and not WHATSAPP_ACCESS_TOKEN:
+            errors.append("TELEGRAM_BOT_TOKEN או WHATSAPP_ACCESS_TOKEN לא מוגדרים — אין ערוץ הודעות פעיל")
     if require_admin:
         if not ADMIN_PASSWORD and not ADMIN_PASSWORD_HASH:
             errors.append("ADMIN_PASSWORD / ADMIN_PASSWORD_HASH לא מוגדרים — לא ניתן להתחבר לפאנל האדמין")

@@ -22,6 +22,10 @@ from ai_chatbot.config import TELEGRAM_BOT_TOKEN
 logger = logging.getLogger(__name__)
 
 
+# ── קידומת מזהה משתמש וואטסאפ ─────────────────────────────────────────────
+_WA_PREFIX = "wa_"
+
+
 # ── Telegram & Username Helpers ──────────────────────────────────────────────
 
 
@@ -39,6 +43,20 @@ def send_telegram_message(chat_id: str, text: str) -> bool:
     except Exception as e:
         logger.error("Failed to send Telegram message to %s: %s", chat_id, e)
         return False
+
+
+def send_message_to_user(user_id: str, text: str) -> bool:
+    """שליחת הודעה למשתמש — ניתוב אוטומטי לפי ערוץ (טלגרם/וואטסאפ)."""
+    if user_id.startswith(_WA_PREFIX):
+        phone = user_id[len(_WA_PREFIX):]
+        try:
+            from ai_chatbot.bot.whatsapp_api import send_text_message
+            return send_text_message(phone, text)
+        except Exception as e:
+            logger.error("Failed to send WhatsApp message to %s: %s", phone, e)
+            return False
+    else:
+        return send_telegram_message(user_id, text)
 
 
 def _get_customer_username(user_id: str) -> str:
@@ -130,11 +148,11 @@ class LiveChatService:
         db.handle_pending_requests_for_user(user_id)
 
         notify_msg = "👤 נציג אנושי הצטרף לשיחה. כעת תקבלו מענה ישיר."
-        sent = send_telegram_message(user_id, notify_msg)
+        sent = send_message_to_user(user_id, notify_msg)
         if sent:
             db.save_message(user_id, username, "assistant", notify_msg)
 
-        return sent, "started" if sent else "telegram_failed"
+        return sent, "started" if sent else "send_failed"
 
     @staticmethod
     def end(user_id: str) -> tuple[bool, str]:
@@ -156,14 +174,14 @@ class LiveChatService:
             "🤖 הבוט חזר לנהל את השיחה. "
             "אם תרצו לדבר עם נציג שוב, לחצו על 'דברו עם נציג'."
         )
-        sent = send_telegram_message(user_id, end_msg)
+        sent = send_message_to_user(user_id, end_msg)
         if sent:
             db.save_message(user_id, username, "assistant", end_msg)
 
         # Deactivate AFTER sending notification
         db.end_live_chat(user_id)
 
-        return sent, "ended" if sent else "telegram_failed"
+        return sent, "ended" if sent else "send_failed"
 
     @staticmethod
     def send(user_id: str, message_text: str) -> tuple[bool, str]:
@@ -181,9 +199,9 @@ class LiveChatService:
         if not message_text or not message_text.strip():
             return False, "empty_message"
 
-        sent = send_telegram_message(user_id, message_text)
+        sent = send_message_to_user(user_id, message_text)
         if not sent:
-            return False, "telegram_failed"
+            return False, "send_failed"
 
         username = _get_customer_username(user_id)
         db.save_message(user_id, username, "assistant", message_text)
